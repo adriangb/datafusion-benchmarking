@@ -52,6 +52,9 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     // Pre-install stable toolchain to avoid rustup race in parallel builds
     git::rustup_stable().await?;
 
+    // Set up required benchmark data (e.g. sql_planner needs clickbench_partitioned)
+    setup_benchmark_data(bench_name, &branch_dir, &base_dir).await;
+
     // Post "running" comment
     let uname = shell::uname().await;
     let bench_command_display = format!("cargo bench --features=parquet --bench {bench_name}");
@@ -253,6 +256,52 @@ fn format_branch_only_result_comment(
     )
 }
 
+/// Return the dataset names required by a given criterion benchmark.
+fn required_datasets(bench_name: &str) -> &'static [&'static str] {
+    match bench_name {
+        "sql_planner" => &["clickbench_partitioned"],
+        _ => &[],
+    }
+}
+
+/// Set up benchmark data for criterion benchmarks that need it.
+///
+/// Generates data once in the branch directory and symlinks it into the base
+/// directory so both sides share the same input data.
+async fn setup_benchmark_data(bench_name: &str, branch_dir: &Path, base_dir: &Path) {
+    let datasets = required_datasets(bench_name);
+    if datasets.is_empty() {
+        return;
+    }
+
+    let branch_benchmarks = branch_dir.join("benchmarks");
+    let bench_dir_str = branch_benchmarks.to_string_lossy().to_string();
+
+    for dataset in datasets {
+        info!("Setting up data for {dataset}");
+        cache_data(dataset, &bench_dir_str).await;
+    }
+
+    // Symlink the data directory into the base checkout so both sides can
+    // find it without duplicating storage.
+    let branch_data = branch_benchmarks.join("data");
+    let base_data = base_dir.join("benchmarks/data");
+    if branch_data.exists() && !base_data.exists() {
+        info!("Symlinking benchmark data into base directory");
+        let _ = tokio::fs::symlink(&branch_data, &base_data).await;
+    }
+}
+
+/// Run data generation with cache support via /scripts/cache_data.sh.
+async fn cache_data(bench: &str, bench_dir: &str) {
+    let cache_script = Path::new("/scripts/cache_data.sh");
+    if cache_script.exists() {
+        let _ = shell::run_command(cache_script.to_str().unwrap(), &[bench, bench_dir], Path::new(bench_dir)).await;
+    } else {
+        let _ = shell::run_command("./bench.sh", &["data", bench], Path::new(bench_dir)).await;
+    }
+}
+
 /// Convert Vec<String> to a slice of &str for run_command.
 fn str_slice(v: &[String]) -> Vec<&str> {
     v.iter().map(|s| s.as_str()).collect()
@@ -261,6 +310,19 @@ fn str_slice(v: &[String]) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_datasets_sql_planner() {
+        assert_eq!(
+            required_datasets("sql_planner"),
+            &["clickbench_partitioned"]
+        );
+    }
+
+    #[test]
+    fn required_datasets_unknown_returns_empty() {
+        assert!(required_datasets("unknown_bench").is_empty());
+    }
 
     #[test]
     fn bench_args_construction() {
