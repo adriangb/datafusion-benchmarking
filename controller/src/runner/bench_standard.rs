@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::info;
 
-use crate::github::GitHubClient;
+use crate::github::{self, GitHubClient};
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
@@ -82,13 +82,14 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
         format!("{} (merge-base)", &base_sha[..7.min(base_sha.len())])
     };
 
+    let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let running_body = format!(
         "\u{1f916} Benchmark running (GKE) | [trigger]({})\n\
          `{uname}`\n\
          Comparing {changed_display} ({changed_sha}) to {baseline_label} \
          [diff](https://github.com/{repo}/compare/{base_sha}..{changed_sha}) \
          using: {benchmarks}\n\
-         Results will be posted here when complete",
+         Results will be posted here when complete{footer}",
         config.comment_url,
         repo = config.repo,
     );
@@ -190,7 +191,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     .context("bench.sh compare")?;
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
-    let result_body = format_result_comment(&config.comment_url, &report, &resource_section);
+    let result_body = format_result_comment(&config.comment_url, &report, &resource_section, &footer);
     gh.post_comment(&config.repo, pr_number, &result_body)
         .await?;
 
@@ -259,7 +260,12 @@ fn format_resource_section(
 }
 
 /// Format the result comment body.
-fn format_result_comment(comment_url: &str, report: &str, resource_section: &str) -> String {
+fn format_result_comment(
+    comment_url: &str,
+    report: &str,
+    resource_section: &str,
+    footer: &str,
+) -> String {
     format!(
         "\u{1f916} Benchmark completed (GKE) | [trigger]({comment_url})\n\n\
          <details><summary>Details</summary>\n\
@@ -271,7 +277,8 @@ fn format_result_comment(comment_url: &str, report: &str, resource_section: &str
          </details>\n\n\
          <details><summary>Resource Usage</summary>\n\n\
          {resource_section}\
-         </details>\n"
+         </details>\n\
+         {footer}"
     )
 }
 
@@ -285,6 +292,7 @@ mod tests {
             "https://example.com/comment",
             "test report\n",
             "resources\n",
+            "",
         );
         assert!(comment.contains("Benchmark completed"));
         assert!(comment.contains("[trigger](https://example.com/comment)"));

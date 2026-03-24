@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::github::GitHubClient;
+use crate::github::{self, GitHubClient};
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor;
@@ -69,6 +69,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     } else {
         format!("{} (merge-base)", &base_sha[..7.min(base_sha.len())])
     };
+    let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let running_body = format!(
         "\u{1f916} Arrow criterion benchmark running (GKE) | [trigger]({})\n\
          `{uname}`\n\
@@ -77,7 +78,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
          BENCH_NAME={bench_name}\n\
          BENCH_COMMAND={bench_command_display}\n\
          BENCH_FILTER={bench_filter}\n\
-         Results will be posted here when complete",
+         Results will be posted here when complete{footer}",
         config.comment_url,
         repo = config.repo,
     );
@@ -176,7 +177,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
             monitor::format_resource_comment("base (merge-base)", &base_stats.unwrap()),
             monitor::format_resource_comment("branch", &branch_stats),
         );
-        format_result_comment(&config.comment_url, &report, &resource_section)
+        format_result_comment(&config.comment_url, &report, &resource_section, &footer)
     } else {
         let report = shell::run_command("critcmp", &[bench_branch_name.as_str()], &branch_dir)
             .await
@@ -184,7 +185,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
 
         let resource_section =
             monitor::format_resource_comment("branch", &branch_stats).to_string();
-        format_branch_only_result_comment(&config.comment_url, &report, &resource_section)
+        format_branch_only_result_comment(&config.comment_url, &report, &resource_section, &footer)
     };
     gh.post_comment(&config.repo, pr_number, &result_body)
         .await?;
@@ -221,7 +222,12 @@ async fn copy_criterion_baselines(base_dir: &Path, branch_dir: &Path) {
 }
 
 /// Format the result comment body.
-fn format_result_comment(comment_url: &str, report: &str, resource_section: &str) -> String {
+fn format_result_comment(
+    comment_url: &str,
+    report: &str,
+    resource_section: &str,
+    footer: &str,
+) -> String {
     format!(
         "\u{1f916} Arrow criterion benchmark completed (GKE) | [trigger]({comment_url})\n\n\
          <details><summary>Details</summary>\n\
@@ -233,7 +239,8 @@ fn format_result_comment(comment_url: &str, report: &str, resource_section: &str
          </details>\n\n\
          <details><summary>Resource Usage</summary>\n\n\
          {resource_section}\
-         </details>\n"
+         </details>\n\
+         {footer}"
     )
 }
 
@@ -242,6 +249,7 @@ fn format_branch_only_result_comment(
     comment_url: &str,
     report: &str,
     resource_section: &str,
+    footer: &str,
 ) -> String {
     format!(
         "\u{1f916} Arrow criterion benchmark completed (GKE) | [trigger]({comment_url})\n\n\
@@ -255,7 +263,8 @@ fn format_branch_only_result_comment(
          </details>\n\n\
          <details><summary>Resource Usage</summary>\n\n\
          {resource_section}\
-         </details>\n"
+         </details>\n\
+         {footer}"
     )
 }
 
@@ -288,6 +297,7 @@ mod tests {
             "https://example.com/comment",
             "test report\n",
             "resources\n",
+            "",
         );
         assert!(comment.contains("Arrow criterion benchmark completed"));
         assert!(comment.contains("[trigger](https://example.com/comment)"));
@@ -301,6 +311,7 @@ mod tests {
             "https://example.com/comment",
             "branch report\n",
             "branch resources\n",
+            "",
         );
         assert!(comment.contains("Arrow criterion benchmark completed"));
         assert!(comment.contains("New benchmark — branch-only results"));

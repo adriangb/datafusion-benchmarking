@@ -187,6 +187,7 @@ jobs:
             pulumi config set --secret logfireToken '${{ secrets.LOGFIRE_TOKEN }}'
           fi
           pulumi config set imageTag ${{ github.sha }}
+          pulumi config set runnerRepoUrl '${{ github.server_url }}/${{ github.repository }}'
 
       - uses: pulumi/actions@v5
         with:

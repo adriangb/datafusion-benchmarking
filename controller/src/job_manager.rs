@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db;
-use crate::github::GitHubClient;
+use crate::github::{self, GitHubClient};
 use crate::models::{BenchmarkJob, JobStatus};
 
 /// Infinite reconciliation loop that drives jobs through their lifecycle.
@@ -102,8 +102,9 @@ async fn reconcile_pending(
                 .await?;
 
                 let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
+                let footer = github::issues_footer(config.runner_repo_url.as_deref());
                 let msg =
-                    format!("Failed to start benchmark for [this request]({comment_url}): {e}",);
+                    format!("Failed to start benchmark for [this request]({comment_url}): {e}{footer}");
                 if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
                     warn!(error = %e, "failed to post error comment");
                 }
@@ -285,6 +286,11 @@ async fn create_k8s_job(
     // Benchmark data cache: inject bucket name when configured
     if let Some(bucket) = &config.data_cache_bucket {
         env.push(env_var("DATA_CACHE_BUCKET", bucket.clone()));
+    }
+
+    // Pass the benchmark runner repo URL for "file an issue" links
+    if let Some(url) = &config.runner_repo_url {
+        env.push(env_var("RUNNER_REPO_URL", url.clone()));
     }
 
     let mut resource_requests = BTreeMap::new();

@@ -12,6 +12,16 @@ use crate::models::GitHubComment;
 
 const API_BASE: &str = "https://api.github.com";
 
+/// Append the benchmark runner issues link if configured.
+pub fn issues_footer(runner_repo_url: Option<&str>) -> String {
+    match runner_repo_url {
+        Some(url) if !url.is_empty() => {
+            format!("\n\n---\n[File an issue]({url}/issues) against this benchmark runner")
+        }
+        _ => String::new(),
+    }
+}
+
 /// Maximum number of pages to fetch when paginating (10,000 comments at 100/page).
 const MAX_PAGES: usize = 100;
 

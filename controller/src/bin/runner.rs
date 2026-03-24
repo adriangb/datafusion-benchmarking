@@ -6,7 +6,7 @@
 use anyhow::Result;
 use tracing::{error, info};
 
-use benchmark_controller::github::GitHubClient;
+use benchmark_controller::github::{self, GitHubClient};
 use benchmark_controller::runner::config::{BenchType, RunnerConfig};
 use benchmark_controller::runner::{bench_arrow, bench_criterion, bench_standard, shell};
 
@@ -66,6 +66,7 @@ async fn run_benchmark(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
 async fn post_error_comment(config: &RunnerConfig, gh: &GitHubClient) {
     let tail = shell::tail_log(20).await;
 
+    let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let body = format!(
         "Benchmark for [this request]({}) failed.\n\n\
          Last 20 lines of output:\n\
@@ -73,7 +74,7 @@ async fn post_error_comment(config: &RunnerConfig, gh: &GitHubClient) {
          ```\n\
          {tail}\n\
          ```\n\n\
-         </details>",
+         </details>{footer}",
         config.comment_url,
     );
 

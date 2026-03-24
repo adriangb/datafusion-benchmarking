@@ -68,6 +68,7 @@ pub struct BenchmarkConfig {
 /// STORAGE_CLASS             hyperdisk-balanced                    no
 /// SCCACHE_GCS_BUCKET        —                                     no
 /// DATA_CACHE_BUCKET          —                                     no
+/// RUNNER_REPO_URL            —                                     no
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -94,6 +95,8 @@ pub struct Config {
     pub sccache_gcs_bucket: Option<String>,
     /// GCS bucket for caching benchmark data (TPC-H, ClickBench, etc.).
     pub data_cache_bucket: Option<String>,
+    /// URL of the benchmark runner's own GitHub repo (for "file an issue" links).
+    pub runner_repo_url: Option<String>,
 }
 
 impl Config {
@@ -125,6 +128,7 @@ impl Config {
             storage_class: env_or("STORAGE_CLASS", "hyperdisk-balanced"),
             sccache_gcs_bucket: std::env::var("SCCACHE_GCS_BUCKET").ok(),
             data_cache_bucket: std::env::var("DATA_CACHE_BUCKET").ok(),
+            runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
         })
     }
 }

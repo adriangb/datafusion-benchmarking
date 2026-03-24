@@ -2,7 +2,7 @@
 //!
 //! The controller passes these env vars to the runner K8s pod (see `job_manager.rs`):
 //! `PR_URL`, `COMMENT_ID`, `BENCHMARKS`, `BENCH_TYPE`, `BENCH_NAME`,
-//! `BENCH_FILTER`, `REPO`, `GITHUB_TOKEN`, `JOB_NAME`.
+//! `BENCH_FILTER`, `REPO`, `GITHUB_TOKEN`, `JOB_NAME`, `RUNNER_REPO_URL`.
 
 use std::collections::HashMap;
 
@@ -47,6 +47,8 @@ pub struct RunnerConfig {
     pub changed_env_vars: HashMap<String, String>,
     pub baseline_ref: Option<String>,
     pub changed_ref: Option<String>,
+    /// URL of the benchmark runner's own GitHub repo (for "file an issue" links).
+    pub runner_repo_url: Option<String>,
 }
 
 impl RunnerConfig {
@@ -82,6 +84,7 @@ impl RunnerConfig {
             changed_env_vars,
             baseline_ref: std::env::var("BASELINE_REF").ok(),
             changed_ref: std::env::var("CHANGED_REF").ok(),
+            runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
         })
     }
 

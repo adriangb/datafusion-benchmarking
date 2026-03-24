@@ -14,7 +14,7 @@ use crate::benchmarks::{
 };
 use crate::config::{BenchmarkConfig, Config, RepoEntry};
 use crate::db;
-use crate::github::GitHubClient;
+use crate::github::{self, GitHubClient};
 use crate::models::{GitHubComment, JobInsert};
 
 /// Infinite loop that polls GitHub for new PR comments on each watched repo.
@@ -47,6 +47,7 @@ pub async fn poll_loop(
                 &config.benchmark_config,
                 repo,
                 config.poll_interval_secs,
+                config.runner_repo_url.as_deref(),
             )
             .await
             {
@@ -64,13 +65,14 @@ pub async fn poll_loop(
 }
 
 /// Fetch and process recent comments for a single repo.
-#[tracing::instrument(skip(pool, gh, bench_cfg, poll_interval_secs))]
+#[tracing::instrument(skip(pool, gh, bench_cfg, poll_interval_secs, runner_repo_url))]
 async fn poll_repo(
     pool: &SqlitePool,
     gh: &GitHubClient,
     bench_cfg: &BenchmarkConfig,
     repo: &str,
     poll_interval_secs: u64,
+    runner_repo_url: Option<&str>,
 ) -> Result<()> {
     let repo_entry = match bench_cfg.repos.get(repo) {
         Some(e) => e,
@@ -92,7 +94,9 @@ async fn poll_repo(
     info!(repo, count = comments.len(), "fetched comments");
 
     for comment in &comments {
-        if let Err(e) = process_comment(pool, gh, bench_cfg, repo, repo_entry, comment).await {
+        if let Err(e) =
+            process_comment(pool, gh, bench_cfg, repo, repo_entry, comment, runner_repo_url).await
+        {
             warn!(comment_id = comment.id, error = ?e, "process comment error");
         }
     }
@@ -111,11 +115,13 @@ fn not_allowed_message(
     login: &str,
     comment_url: &str,
     allowed_users: &std::collections::HashSet<String>,
+    runner_repo_url: Option<&str>,
 ) -> String {
+    let footer = github::issues_footer(runner_repo_url);
     format!(
         "Hi @{login}, thanks for the request ({comment_url}). \
          Only whitelisted users can trigger benchmarks. \
-         Allowed users: {}.",
+         Allowed users: {}.{footer}",
         allowed_users_markdown(allowed_users)
     )
 }
@@ -128,6 +134,7 @@ async fn process_comment(
     repo: &str,
     repo_entry: &RepoEntry,
     comment: &GitHubComment,
+    runner_repo_url: Option<&str>,
 ) -> Result<()> {
     if db::is_comment_seen(pool, comment.id).await? {
         return Ok(());
@@ -137,6 +144,7 @@ async fn process_comment(
     let login = comment.login();
     let comment_url = comment.url();
     let issue_url = comment.issue_url_str();
+    let footer = github::issues_footer(runner_repo_url);
 
     let Some(pr_number) = pr_number_from_url(issue_url) else {
         return Ok(());
@@ -164,7 +172,7 @@ async fn process_comment(
     if is_queue_request(body) {
         info!(pr_number, login, "queue request");
         let jobs = db::get_queue_summary(pool).await?;
-        let msg = format_queue_message(login, comment_url, &jobs);
+        let msg = format!("{}{footer}", format_queue_message(login, comment_url, &jobs));
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
@@ -178,7 +186,7 @@ async fn process_comment(
             if bench_cfg.allowed_users.contains(login) {
                 let msg = format!(
                     "Hi @{login}, your benchmark configuration could not be parsed ({comment_url}).\n\n\
-                     **Error:** `{err}`\n\n{}",
+                     **Error:** `{err}`\n\n{}{footer}",
                     supported_benchmarks_message(repo_entry, &[])
                 );
                 gh.post_comment(repo, pr_number, &msg).await?;
@@ -190,7 +198,12 @@ async fn process_comment(
             // Check if it looks like a failed trigger attempt
             if is_benchmark_trigger(body) {
                 if !bench_cfg.allowed_users.contains(login) {
-                    let msg = not_allowed_message(login, comment_url, &bench_cfg.allowed_users);
+                    let msg = not_allowed_message(
+                        login,
+                        comment_url,
+                        &bench_cfg.allowed_users,
+                        runner_repo_url,
+                    );
                     gh.post_comment(repo, pr_number, &msg).await?;
                 } else {
                     // Singular "run benchmark" with no names, or invalid names
@@ -211,7 +224,7 @@ async fn process_comment(
                         format!("Hi @{login}, thanks for the request ({comment_url}).\n\n")
                     };
                     let msg = format!(
-                        "{prefix}{}",
+                        "{prefix}{}{footer}",
                         supported_benchmarks_message(repo_entry, &requested)
                     );
                     gh.post_comment(repo, pr_number, &msg).await?;
@@ -225,7 +238,7 @@ async fn process_comment(
 
     // User must be allowed — mark seen only after reply succeeds.
     if !bench_cfg.allowed_users.contains(login) {
-        let msg = not_allowed_message(login, comment_url, &bench_cfg.allowed_users);
+        let msg = not_allowed_message(login, comment_url, &bench_cfg.allowed_users, runner_repo_url);
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
@@ -388,7 +401,7 @@ mod tests {
     fn not_allowed_msg_contains_fields() {
         let users: std::collections::HashSet<String> =
             ["alamb"].iter().map(|s| s.to_string()).collect();
-        let msg = not_allowed_message("testuser", "https://example.com/comment/1", &users);
+        let msg = not_allowed_message("testuser", "https://example.com/comment/1", &users, None);
         assert!(msg.contains("@testuser"));
         assert!(msg.contains("https://example.com/comment/1"));
         assert!(msg.contains("whitelisted") || msg.contains("Whitelisted"));

@@ -187,6 +187,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
             ] : []),
             { name: "SCCACHE_GCS_BUCKET", value: sccacheGcsBucket },
             { name: "DATA_CACHE_BUCKET", value: dataCacheGcsBucket },
+            { name: "RUNNER_REPO_URL", value: config.get("runnerRepoUrl") || "" },
             { name: "LOGFIRE_SERVICE_NAME", value: "benchmark-controller" },
             { name: "LOGFIRE_ENVIRONMENT", value: "production" },
             {
