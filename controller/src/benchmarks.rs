@@ -205,9 +205,9 @@ pub fn detect_benchmark(repo_entry: &RepoEntry, body: &str) -> DetectResult {
             let criterion = repo_entry.criterion_set();
             let criterion_any = repo_entry.criterion_allows_any();
 
-            let all_valid = names
-                .iter()
-                .all(|n| standard.contains(n.as_str()) || criterion_any || criterion.contains(n.as_str()));
+            let all_valid = names.iter().all(|n| {
+                standard.contains(n.as_str()) || criterion_any || criterion.contains(n.as_str())
+            });
 
             if all_valid {
                 DetectResult::Parsed(BenchmarkRequest {
@@ -280,7 +280,11 @@ pub fn supported_benchmarks_message(repo_entry: &RepoEntry, requested: &[String]
 
     let bad: Vec<&String> = requested
         .iter()
-        .filter(|n| !standard_set.contains(n.as_str()) && !criterion_any && !criterion_set.contains(n.as_str()))
+        .filter(|n| {
+            !standard_set.contains(n.as_str())
+                && !criterion_any
+                && !criterion_set.contains(n.as_str())
+        })
         .collect();
 
     let unsupported = if bad.is_empty() {
@@ -708,7 +712,8 @@ mod tests {
 
     #[test]
     fn supported_msg_wildcard_shows_any() {
-        let msg = supported_benchmarks_message(&wildcard_criterion_entry(), &["unknown".to_string()]);
+        let msg =
+            supported_benchmarks_message(&wildcard_criterion_entry(), &["unknown".to_string()]);
         assert!(msg.contains("(any)"));
         assert!(!msg.contains("Unsupported"));
     }

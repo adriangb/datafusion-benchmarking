@@ -191,7 +191,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     .context("bench.sh compare")?;
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
-    let result_body = format_result_comment(&config.comment_url, &report, &resource_section, &footer);
+    let result_body =
+        format_result_comment(&config.comment_url, &report, &resource_section, &footer);
     gh.post_comment(&config.repo, pr_number, &result_body)
         .await?;
 

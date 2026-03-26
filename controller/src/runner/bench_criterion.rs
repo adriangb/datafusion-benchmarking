@@ -305,7 +305,12 @@ async fn setup_benchmark_data(bench_name: &str, branch_dir: &Path, base_dir: &Pa
 async fn cache_data(bench: &str, bench_dir: &str) {
     let cache_script = Path::new("/scripts/cache_data.sh");
     if cache_script.exists() {
-        let _ = shell::run_command(cache_script.to_str().unwrap(), &[bench, bench_dir], Path::new(bench_dir)).await;
+        let _ = shell::run_command(
+            cache_script.to_str().unwrap(),
+            &[bench, bench_dir],
+            Path::new(bench_dir),
+        )
+        .await;
     } else {
         let _ = shell::run_command("./bench.sh", &["data", bench], Path::new(bench_dir)).await;
     }

@@ -103,8 +103,9 @@ async fn reconcile_pending(
 
                 let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
                 let footer = github::issues_footer(config.runner_repo_url.as_deref());
-                let msg =
-                    format!("Failed to start benchmark for [this request]({comment_url}): {e}{footer}");
+                let msg = format!(
+                    "Failed to start benchmark for [this request]({comment_url}): {e}{footer}"
+                );
                 if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
                     warn!(error = %e, "failed to post error comment");
                 }

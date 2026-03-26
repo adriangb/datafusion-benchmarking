@@ -94,8 +94,16 @@ async fn poll_repo(
     info!(repo, count = comments.len(), "fetched comments");
 
     for comment in &comments {
-        if let Err(e) =
-            process_comment(pool, gh, bench_cfg, repo, repo_entry, comment, runner_repo_url).await
+        if let Err(e) = process_comment(
+            pool,
+            gh,
+            bench_cfg,
+            repo,
+            repo_entry,
+            comment,
+            runner_repo_url,
+        )
+        .await
         {
             warn!(comment_id = comment.id, error = ?e, "process comment error");
         }
@@ -172,7 +180,10 @@ async fn process_comment(
     if is_queue_request(body) {
         info!(pr_number, login, "queue request");
         let jobs = db::get_queue_summary(pool).await?;
-        let msg = format!("{}{footer}", format_queue_message(login, comment_url, &jobs));
+        let msg = format!(
+            "{}{footer}",
+            format_queue_message(login, comment_url, &jobs)
+        );
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
@@ -238,7 +249,12 @@ async fn process_comment(
 
     // User must be allowed — mark seen only after reply succeeds.
     if !bench_cfg.allowed_users.contains(login) {
-        let msg = not_allowed_message(login, comment_url, &bench_cfg.allowed_users, runner_repo_url);
+        let msg = not_allowed_message(
+            login,
+            comment_url,
+            &bench_cfg.allowed_users,
+            runner_repo_url,
+        );
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
