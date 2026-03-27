@@ -87,6 +87,30 @@ const controllerRoleBinding = new k8s.rbac.v1.RoleBinding("benchmark-controller"
   }],
 }, { provider: k8sProvider, dependsOn: [controllerRole, controllerKsa] });
 
+// RBAC — allow the runner SA to read node metadata (for instance-type labels)
+const runnerNodeReaderRole = new k8s.rbac.v1.ClusterRole("benchmark-runner-node-reader", {
+  metadata: { name: "benchmark-runner-node-reader" },
+  rules: [{
+    apiGroups: [""],
+    resources: ["nodes"],
+    verbs: ["get"],
+  }],
+}, { provider: k8sProvider });
+
+const runnerNodeReaderBinding = new k8s.rbac.v1.ClusterRoleBinding("benchmark-runner-node-reader", {
+  metadata: { name: "benchmark-runner-node-reader" },
+  roleRef: {
+    apiGroup: "rbac.authorization.k8s.io",
+    kind: "ClusterRole",
+    name: "benchmark-runner-node-reader",
+  },
+  subjects: [{
+    kind: "ServiceAccount",
+    name: "benchmark-runner",
+    namespace: "benchmarking",
+  }],
+}, { provider: k8sProvider, dependsOn: [runnerNodeReaderRole, runnerKsa] });
+
 // StorageClass for benchmark runner workspace volumes
 const hyperdiskBalanced = new k8s.storage.v1.StorageClass("hyperdisk-balanced", {
   metadata: { name: "hyperdisk-balanced" },

@@ -294,6 +294,54 @@ async fn create_k8s_job(
         env.push(env_var("RUNNER_REPO_URL", url.clone()));
     }
 
+    // Map per-job cpu_arch (arm64/amd64) to a machine family, or use the config default.
+    let machine_family = match job.cpu_arch.as_deref() {
+        Some("arm64") => "c4a",
+        Some("amd64") | Some("x86_64") => "c4",
+        _ => &config.default_machine_family,
+    };
+    let arch = if machine_family == "c4a" {
+        "arm64"
+    } else {
+        "amd64"
+    };
+
+    // Expose pod metadata via the Downward API so the runner can include
+    // instance details in PR comments.
+    env.push(EnvVar {
+        name: "NODE_NAME".into(),
+        value_from: Some(EnvVarSource {
+            field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                field_path: "spec.nodeName".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    env.push(EnvVar {
+        name: "POD_CPU_LIMIT".into(),
+        value_from: Some(EnvVarSource {
+            resource_field_ref: Some(k8s_openapi::api::core::v1::ResourceFieldSelector {
+                resource: "limits.cpu".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    env.push(EnvVar {
+        name: "POD_MEM_LIMIT".into(),
+        value_from: Some(EnvVarSource {
+            resource_field_ref: Some(k8s_openapi::api::core::v1::ResourceFieldSelector {
+                resource: "limits.memory".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
     let mut resource_requests = BTreeMap::new();
     resource_requests.insert("cpu".to_string(), Quantity(cpu.to_string()));
     resource_requests.insert("memory".to_string(), Quantity(memory.to_string()));
@@ -307,18 +355,6 @@ async fn create_k8s_job(
     let mut resource_limits = BTreeMap::new();
     resource_limits.insert("cpu".to_string(), Quantity(cpu.to_string()));
     resource_limits.insert("memory".to_string(), Quantity(memory.to_string()));
-
-    // Map per-job cpu_arch (arm64/amd64) to a machine family, or use the config default.
-    let machine_family = match job.cpu_arch.as_deref() {
-        Some("arm64") => "c4a",
-        Some("amd64") | Some("x86_64") => "c4",
-        _ => &config.default_machine_family,
-    };
-    let arch = if machine_family == "c4a" {
-        "arm64"
-    } else {
-        "amd64"
-    };
 
     let mut node_selector = BTreeMap::new();
     node_selector.insert(

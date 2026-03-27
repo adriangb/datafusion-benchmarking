@@ -134,6 +134,74 @@ pub async fn uname() -> String {
     }
 }
 
+/// Get CPU details via lscpu (architecture, model, cores, flags, etc.).
+pub async fn lscpu() -> String {
+    match Command::new("lscpu").output().await {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "lscpu not available".to_string(),
+    }
+}
+
+/// Query the Kubernetes API for the node's instance type label.
+/// Returns a string like "c4a-standard-48" or a fallback message.
+pub async fn node_instance_type() -> String {
+    use k8s_openapi::api::core::v1::Node;
+    use kube::{Api, Client};
+
+    let node_name = match std::env::var("NODE_NAME") {
+        Ok(n) => n,
+        Err(_) => return "unknown (NODE_NAME not set)".to_string(),
+    };
+
+    let client = match Client::try_default().await {
+        Ok(c) => c,
+        Err(_) => return "unknown (k8s client unavailable)".to_string(),
+    };
+
+    let nodes: Api<Node> = Api::all(client);
+    match nodes.get(&node_name).await {
+        Ok(node) => node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("node.kubernetes.io/instance-type"))
+            .cloned()
+            .unwrap_or_else(|| "unknown (label not found)".to_string()),
+        Err(_) => "unknown (node lookup failed)".to_string(),
+    }
+}
+
+/// Build a human-readable pod resource summary from Downward API env vars.
+/// Returns e.g. "12 vCPU / 65Gi RAM" or an empty string if not available.
+pub fn pod_resources() -> String {
+    let cpu = std::env::var("POD_CPU_LIMIT").ok();
+    let mem = std::env::var("POD_MEM_LIMIT").ok();
+    match (cpu, mem) {
+        (Some(c), Some(m)) => {
+            let mem_display = format_bytes(&m);
+            format!("{c} vCPU / {mem_display}")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Format a byte string (from the Downward API) into a human-friendly unit.
+fn format_bytes(bytes_str: &str) -> String {
+    let bytes: u64 = match bytes_str.parse() {
+        Ok(b) => b,
+        Err(_) => return bytes_str.to_string(),
+    };
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.0} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB as f64)
+    }
+}
+
 /// Log sccache stats if sccache is in use.
 pub async fn log_sccache_stats() {
     if std::env::var("RUSTC_WRAPPER").is_ok() {
@@ -174,5 +242,22 @@ mod tests {
     async fn run_command_failure() {
         let result = run_command("false", &[], Path::new("/tmp")).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_bytes_gib() {
+        // 65 GiB in bytes
+        assert_eq!(format_bytes("69793218560"), "65 GiB");
+    }
+
+    #[test]
+    fn format_bytes_mib() {
+        // 512 MiB in bytes
+        assert_eq!(format_bytes("536870912"), "512 MiB");
+    }
+
+    #[test]
+    fn format_bytes_non_numeric() {
+        assert_eq!(format_bytes("65Gi"), "65Gi");
     }
 }

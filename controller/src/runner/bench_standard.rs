@@ -70,6 +70,9 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
 
     // Post "running" comment
     let uname = shell::uname().await;
+    let instance_type = shell::node_instance_type().await;
+    let pod_resources = shell::pod_resources();
+    let lscpu = shell::lscpu().await;
     let pr_number = config.pr_number()?;
 
     // Resolve display names for the comparison
@@ -85,7 +88,12 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let running_body = format!(
         "\u{1f916} Benchmark running (GKE) | [trigger]({})\n\
-         `{uname}`\n\
+         **Instance:** `{instance_type}` ({pod_resources}) | `{uname}`\n\
+         <details><summary>CPU Details (lscpu)</summary>\n\n\
+         ```\n\
+         {lscpu}\n\
+         ```\n\n\
+         </details>\n\n\
          Comparing {changed_display} ({changed_sha}) to {baseline_label} \
          [diff](https://github.com/{repo}/compare/{base_sha}..{changed_sha}) \
          using: {benchmarks}\n\
@@ -191,8 +199,15 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     .context("bench.sh compare")?;
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
-    let result_body =
-        format_result_comment(&config.comment_url, &report, &resource_section, &footer);
+    let result_body = format_result_comment(
+        &config.comment_url,
+        &report,
+        &resource_section,
+        &instance_type,
+        &pod_resources,
+        &lscpu,
+        &footer,
+    );
     gh.post_comment(&config.repo, pr_number, &result_body)
         .await?;
 
@@ -265,10 +280,19 @@ fn format_result_comment(
     comment_url: &str,
     report: &str,
     resource_section: &str,
+    instance_type: &str,
+    pod_resources: &str,
+    lscpu: &str,
     footer: &str,
 ) -> String {
     format!(
         "\u{1f916} Benchmark completed (GKE) | [trigger]({comment_url})\n\n\
+         **Instance:** `{instance_type}` ({pod_resources})\n\n\
+         <details><summary>CPU Details (lscpu)</summary>\n\n\
+         ```\n\
+         {lscpu}\n\
+         ```\n\n\
+         </details>\n\n\
          <details><summary>Details</summary>\n\
          <p>\n\n\
          ```\n\
@@ -293,6 +317,9 @@ mod tests {
             "https://example.com/comment",
             "test report\n",
             "resources\n",
+            "c4a-standard-48",
+            "12 vCPU / 65 GiB",
+            "lscpu output",
             "",
         );
         assert!(comment.contains("Benchmark completed"));
@@ -301,5 +328,8 @@ mod tests {
         assert!(comment.contains("<details>"));
         assert!(comment.contains("Resource Usage"));
         assert!(comment.contains("resources"));
+        assert!(comment.contains("c4a-standard-48"));
+        assert!(comment.contains("12 vCPU / 65 GiB"));
+        assert!(comment.contains("lscpu output"));
     }
 }

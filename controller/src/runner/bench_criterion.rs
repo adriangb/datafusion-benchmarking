@@ -57,6 +57,9 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
 
     // Post "running" comment
     let uname = shell::uname().await;
+    let instance_type = shell::node_instance_type().await;
+    let pod_resources = shell::pod_resources();
+    let lscpu = shell::lscpu().await;
     let bench_command_display = format!("cargo bench --features=parquet --bench {bench_name}");
     let changed_display = config.changed_ref.as_deref().unwrap_or(&branch_name);
     let changed_sha = git::rev_parse_head(&branch_dir).await?;
@@ -69,7 +72,12 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let running_body = format!(
         "\u{1f916} Criterion benchmark running (GKE) | [trigger]({})\n\
-         `{uname}`\n\
+         **Instance:** `{instance_type}` ({pod_resources}) | `{uname}`\n\
+         <details><summary>CPU Details (lscpu)</summary>\n\n\
+         ```\n\
+         {lscpu}\n\
+         ```\n\n\
+         </details>\n\n\
          Comparing {changed_display} ({changed_sha}) to {baseline_label} \
          [diff](https://github.com/{repo}/compare/{base_sha}..{changed_sha})\n\
          BENCH_NAME={bench_name}\n\
@@ -174,7 +182,15 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
             monitor::format_resource_comment("base (merge-base)", &base_stats.unwrap()),
             monitor::format_resource_comment("branch", &branch_stats),
         );
-        format_result_comment(&config.comment_url, &report, &resource_section, &footer)
+        format_result_comment(
+            &config.comment_url,
+            &report,
+            &resource_section,
+            &instance_type,
+            &pod_resources,
+            &lscpu,
+            &footer,
+        )
     } else {
         let report = shell::run_command("critcmp", &[bench_branch_name.as_str()], &branch_dir)
             .await
@@ -182,7 +198,15 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
 
         let resource_section =
             monitor::format_resource_comment("branch", &branch_stats).to_string();
-        format_branch_only_result_comment(&config.comment_url, &report, &resource_section, &footer)
+        format_branch_only_result_comment(
+            &config.comment_url,
+            &report,
+            &resource_section,
+            &instance_type,
+            &pod_resources,
+            &lscpu,
+            &footer,
+        )
     };
     gh.post_comment(&config.repo, pr_number, &result_body)
         .await?;
@@ -223,10 +247,19 @@ fn format_result_comment(
     comment_url: &str,
     report: &str,
     resource_section: &str,
+    instance_type: &str,
+    pod_resources: &str,
+    lscpu: &str,
     footer: &str,
 ) -> String {
     format!(
         "\u{1f916} Criterion benchmark completed (GKE) | [trigger]({comment_url})\n\n\
+         **Instance:** `{instance_type}` ({pod_resources})\n\n\
+         <details><summary>CPU Details (lscpu)</summary>\n\n\
+         ```\n\
+         {lscpu}\n\
+         ```\n\n\
+         </details>\n\n\
          <details><summary>Details</summary>\n\
          <p>\n\n\
          ```\n\
@@ -246,10 +279,19 @@ fn format_branch_only_result_comment(
     comment_url: &str,
     report: &str,
     resource_section: &str,
+    instance_type: &str,
+    pod_resources: &str,
+    lscpu: &str,
     footer: &str,
 ) -> String {
     format!(
         "\u{1f916} Criterion benchmark completed (GKE) | [trigger]({comment_url})\n\n\
+         **Instance:** `{instance_type}` ({pod_resources})\n\n\
+         <details><summary>CPU Details (lscpu)</summary>\n\n\
+         ```\n\
+         {lscpu}\n\
+         ```\n\n\
+         </details>\n\n\
          **New benchmark — branch-only results (no baseline comparison)**\n\n\
          <details><summary>Details</summary>\n\
          <p>\n\n\
@@ -353,6 +395,9 @@ mod tests {
             "https://example.com/comment",
             "test report\n",
             "resources\n",
+            "c4a-standard-48",
+            "12 vCPU / 65 GiB",
+            "lscpu output",
             "",
         );
         assert!(comment.contains("Criterion benchmark completed"));
@@ -360,6 +405,9 @@ mod tests {
         assert!(comment.contains("test report"));
         assert!(comment.contains("<details>"));
         assert!(comment.contains("Resource Usage"));
+        assert!(comment.contains("c4a-standard-48"));
+        assert!(comment.contains("12 vCPU / 65 GiB"));
+        assert!(comment.contains("lscpu output"));
     }
 
     #[test]
@@ -368,6 +416,9 @@ mod tests {
             "https://example.com/comment",
             "branch report\n",
             "branch resources\n",
+            "c4a-standard-48",
+            "12 vCPU / 65 GiB",
+            "lscpu output",
             "",
         );
         assert!(comment.contains("Criterion benchmark completed"));
@@ -376,5 +427,8 @@ mod tests {
         assert!(comment.contains("branch report"));
         assert!(comment.contains("Resource Usage"));
         assert!(comment.contains("branch resources"));
+        assert!(comment.contains("c4a-standard-48"));
+        assert!(comment.contains("12 vCPU / 65 GiB"));
+        assert!(comment.contains("lscpu output"));
     }
 }
