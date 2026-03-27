@@ -143,6 +143,13 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                 "alamb", "Dandandan", "adriangb", "rluvaton", "geoffreyclaude",
                 "xudong963", "zhuqi-lucas", "Omega359", "comphead", "klion26",
                 "gabotechs", "Jefffrey", "etseidl", "kosiew",
+                // top 15 contributors (last month) - apache/datafusion
+                "neilconway", "kumarUjjawal", "buraksenn", "friendlymatthew",
+                "erenavsarogullari", "timsaucer", "jonathanc-n", "haohuaijin",
+                "mbutrovich", "kevinjqliu",
+                // top 15 contributors (last month) - apache/arrow-rs
+                "mzabaluev", "sdf-jkl", "liamzwbao", "cetra3", "brunal",
+                "Fokko", "kunalsinghdadhwal", "grtlr", "codephage2020", "asubiotto",
               ],
               repos: {
                 "adriangb/datafusion": {
