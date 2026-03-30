@@ -65,6 +65,7 @@ impl RepoEntry {
 ///
 /// Supports an optional ` ```yaml ` / ` ``` ` fence around the YAML content.
 /// Returns `Err` with a human-readable message if YAML is present but invalid.
+#[allow(clippy::type_complexity)]
 fn parse_sections(
     lines: &[&str],
 ) -> Result<
