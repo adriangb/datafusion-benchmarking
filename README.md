@@ -86,6 +86,8 @@ show benchmark queue
 | `clickbench_pushdown` | ClickBench pushdown queries |
 | `external_aggr` | External aggregation |
 | `tpcds` | TPC-DS |
+| `smj` | Sort-merge join |
+| `sort_pushdown` | Sort pushdown |
 
 ### DataFusion (criterion)
 

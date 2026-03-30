@@ -351,6 +351,8 @@ mod tests {
                 "clickbench_pushdown".into(),
                 "external_aggr".into(),
                 "tpcds".into(),
+                "smj".into(),
+                "sort_pushdown".into(),
             ],
             criterion: vec!["sql_planner".into(), "in_list".into(), "case_when".into()],
             criterion_type: "datafusion".into(),

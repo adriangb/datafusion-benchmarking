@@ -181,7 +181,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                     "tpch", "tpch10", "tpch_mem", "tpch_mem10",
                     "clickbench_partitioned", "clickbench_extended",
                     "clickbench_1", "clickbench_pushdown",
-                    "external_aggr", "tpcds", "smj",
+                    "external_aggr", "tpcds", "smj", "sort_pushdown",
                   ],
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
@@ -193,7 +193,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                     "tpch", "tpch10", "tpch_mem", "tpch_mem10",
                     "clickbench_partitioned", "clickbench_extended",
                     "clickbench_1", "clickbench_pushdown",
-                    "external_aggr", "tpcds", "smj",
+                    "external_aggr", "tpcds", "smj", "sort_pushdown",
                   ],
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
