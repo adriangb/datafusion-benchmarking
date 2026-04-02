@@ -88,6 +88,7 @@ show benchmark queue
 | `tpcds` | TPC-DS |
 | `smj` | Sort-merge join |
 | `sort_pushdown` | Sort pushdown |
+| `sort_pushdown_sorted` | Sort pushdown sorted |
 
 ### DataFusion (criterion)
 

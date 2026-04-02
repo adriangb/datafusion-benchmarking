@@ -354,6 +354,7 @@ mod tests {
                 "tpcds".into(),
                 "smj".into(),
                 "sort_pushdown".into(),
+                "sort_pushdown_sorted".into(),
             ],
             criterion: vec!["sql_planner".into(), "in_list".into(), "case_when".into()],
             criterion_type: "datafusion".into(),
