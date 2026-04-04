@@ -1,6 +1,6 @@
 //! Command execution helpers for the benchmark runner.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -45,12 +45,16 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
 }
 
 /// Run a command with cgroup resource monitoring. Returns both stdout and resource stats.
+///
+/// If `spill_dir` is provided, the monitor will poll the directory size every
+/// second to track peak spill usage.
 pub async fn run_command_monitored(
     cmd: &str,
     args: &[&str],
     cwd: &Path,
+    spill_dir: Option<PathBuf>,
 ) -> Result<(String, ResourceStats)> {
-    let monitor = CgroupMonitor::start();
+    let monitor = CgroupMonitor::start(spill_dir);
     let output = run_command(cmd, args, cwd).await?;
     let stats = monitor.finish().await;
     Ok((output, stats))

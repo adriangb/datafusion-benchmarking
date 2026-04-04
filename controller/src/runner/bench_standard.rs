@@ -151,10 +151,16 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
         cache_data(bench, &bench_dir_str).await;
 
         info!("** Running {bench} baseline **");
+        let base_spill_dir = PathBuf::from(format!("/workspace/spill-base-{bench}"));
+        let _ = tokio::fs::create_dir_all(&base_spill_dir).await;
         let base_dir_str = base_dir.to_string_lossy().to_string();
         let mut base_args: Vec<String> = vec![
             format!("DATAFUSION_DIR={base_dir_str}"),
             format!("RESULTS_NAME={base_results_name}"),
+            format!(
+                "DATAFUSION_RUNTIME_TEMP_DIRECTORY={}",
+                base_spill_dir.display()
+            ),
         ];
         base_args.extend(baseline_extra_env.iter().cloned());
         base_args.extend([
@@ -163,17 +169,28 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
             bench.to_string(),
         ]);
         let base_args_ref: Vec<&str> = base_args.iter().map(|s| s.as_str()).collect();
-        let (_, base_stats) =
-            shell::run_command_monitored("env", &base_args_ref, &bench_benchmarks)
-                .await
-                .with_context(|| format!("bench.sh run {bench} (base)"))?;
+        let (_, base_stats) = shell::run_command_monitored(
+            "env",
+            &base_args_ref,
+            &bench_benchmarks,
+            Some(base_spill_dir.clone()),
+        )
+        .await
+        .with_context(|| format!("bench.sh run {bench} (base)"))?;
+        let _ = tokio::fs::remove_dir_all(&base_spill_dir).await;
         base_stats_list.push((bench, base_stats));
 
         info!("** Running {bench} branch **");
+        let branch_spill_dir = PathBuf::from(format!("/workspace/spill-branch-{bench}"));
+        let _ = tokio::fs::create_dir_all(&branch_spill_dir).await;
         let branch_dir_str = branch_dir.to_string_lossy().to_string();
         let mut branch_args: Vec<String> = vec![
             format!("DATAFUSION_DIR={branch_dir_str}"),
             format!("RESULTS_NAME={bench_branch_name}"),
+            format!(
+                "DATAFUSION_RUNTIME_TEMP_DIRECTORY={}",
+                branch_spill_dir.display()
+            ),
         ];
         branch_args.extend(changed_extra_env.iter().cloned());
         branch_args.extend([
@@ -182,10 +199,15 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
             bench.to_string(),
         ]);
         let branch_args_ref: Vec<&str> = branch_args.iter().map(|s| s.as_str()).collect();
-        let (_, branch_stats) =
-            shell::run_command_monitored("env", &branch_args_ref, &bench_benchmarks)
-                .await
-                .with_context(|| format!("bench.sh run {bench} (branch)"))?;
+        let (_, branch_stats) = shell::run_command_monitored(
+            "env",
+            &branch_args_ref,
+            &bench_benchmarks,
+            Some(branch_spill_dir.clone()),
+        )
+        .await
+        .with_context(|| format!("bench.sh run {bench} (branch)"))?;
+        let _ = tokio::fs::remove_dir_all(&branch_spill_dir).await;
         branch_stats_list.push((bench, branch_stats));
     }
 

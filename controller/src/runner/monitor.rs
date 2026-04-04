@@ -6,6 +6,7 @@
 //! to zero.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,8 +26,7 @@ pub struct ResourceStats {
     pub avg_memory_bytes: u64,
     pub cpu_user_usec: u64,
     pub cpu_sys_usec: u64,
-    pub io_read_bytes: u64,
-    pub io_write_bytes: u64,
+    pub peak_spill_bytes: u64,
     pub sample_count: u32,
 }
 
@@ -55,8 +55,7 @@ impl fmt::Display for ResourceStats {
             "| CPU sys | {:.1}s |",
             self.cpu_sys_usec as f64 / 1_000_000.0
         )?;
-        writeln!(f, "| Disk read | {} |", format_bytes(self.io_read_bytes))?;
-        write!(f, "| Disk write | {} |", format_bytes(self.io_write_bytes))
+        write!(f, "| Peak spill | {} |", format_bytes(self.peak_spill_bytes))
     }
 }
 
@@ -89,42 +88,40 @@ struct CpuStat {
     system_usec: u64,
 }
 
-#[derive(Debug)]
-struct IoStat {
-    read_bytes: u64,
-    write_bytes: u64,
-}
-
 /// Monitors cgroup v2 resource usage during benchmark execution.
 pub struct CgroupMonitor {
     start_time: Instant,
     start_memory: u64,
     start_cpu: Option<CpuStat>,
-    start_io: Option<IoStat>,
     stop_flag: Arc<AtomicBool>,
     peak_memory: Arc<AtomicU64>,
     memory_sum: Arc<AtomicU64>,
+    peak_spill: Arc<AtomicU64>,
     sample_count: Arc<AtomicU64>,
     poll_handle: JoinHandle<()>,
 }
 
 impl CgroupMonitor {
     /// Begin monitoring. Snapshots current cgroup values as baselines and
-    /// spawns a background polling task for memory tracking.
-    pub fn start() -> Self {
+    /// spawns a background polling task for memory and spill directory tracking.
+    ///
+    /// If `spill_dir` is provided, the polling loop will also sample the total
+    /// size of files in that directory every second to track peak spill usage.
+    pub fn start(spill_dir: Option<PathBuf>) -> Self {
         let start_memory = read_memory_current().unwrap_or(0);
         let start_cpu = read_cpu_stat();
-        let start_io = read_io_stat();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let peak_memory = Arc::new(AtomicU64::new(start_memory));
         let memory_sum = Arc::new(AtomicU64::new(start_memory));
+        let peak_spill = Arc::new(AtomicU64::new(0));
         let sample_count = Arc::new(AtomicU64::new(1));
 
         let poll_handle = {
             let stop = stop_flag.clone();
             let peak = peak_memory.clone();
             let sum = memory_sum.clone();
+            let spill_peak = peak_spill.clone();
             let count = sample_count.clone();
 
             tokio::spawn(async move {
@@ -138,6 +135,10 @@ impl CgroupMonitor {
                         sum.fetch_add(current, Ordering::Relaxed);
                         count.fetch_add(1, Ordering::Relaxed);
                     }
+                    if let Some(ref dir) = spill_dir {
+                        let size = dir_size(dir);
+                        spill_peak.fetch_max(size, Ordering::Relaxed);
+                    }
                 }
             })
         };
@@ -146,10 +147,10 @@ impl CgroupMonitor {
             start_time: Instant::now(),
             start_memory,
             start_cpu,
-            start_io,
             stop_flag,
             peak_memory,
             memory_sum,
+            peak_spill,
             sample_count,
             poll_handle,
         }
@@ -164,7 +165,6 @@ impl CgroupMonitor {
 
         let end_memory = read_memory_current().unwrap_or(0);
         let end_cpu = read_cpu_stat();
-        let end_io = read_io_stat();
 
         let peak = self.peak_memory.load(Ordering::Relaxed).max(end_memory);
         let total_sum = self.memory_sum.load(Ordering::Relaxed) + end_memory;
@@ -183,13 +183,7 @@ impl CgroupMonitor {
             _ => (0, 0),
         };
 
-        let (io_read, io_write) = match (self.start_io, end_io) {
-            (Some(start), Some(end)) => (
-                end.read_bytes.saturating_sub(start.read_bytes),
-                end.write_bytes.saturating_sub(start.write_bytes),
-            ),
-            _ => (0, 0),
-        };
+        let peak_spill = self.peak_spill.load(Ordering::Relaxed);
 
         ResourceStats {
             wall_time,
@@ -199,8 +193,7 @@ impl CgroupMonitor {
             avg_memory_bytes: avg,
             cpu_user_usec: cpu_user,
             cpu_sys_usec: cpu_sys,
-            io_read_bytes: io_read,
-            io_write_bytes: io_write,
+            peak_spill_bytes: peak_spill,
             sample_count: total_count as u32,
         }
     }
@@ -234,25 +227,30 @@ fn read_cpu_stat() -> Option<CpuStat> {
     })
 }
 
-fn read_io_stat() -> Option<IoStat> {
-    let content = std::fs::read_to_string(format!("{CGROUP_PATH}/io.stat")).ok()?;
-    let mut read_bytes = 0u64;
-    let mut write_bytes = 0u64;
-
-    for line in content.lines() {
-        for field in line.split_whitespace() {
-            if let Some(val) = field.strip_prefix("rbytes=") {
-                read_bytes += val.parse::<u64>().unwrap_or(0);
-            } else if let Some(val) = field.strip_prefix("wbytes=") {
-                write_bytes += val.parse::<u64>().unwrap_or(0);
+/// Recursively sum the sizes of all files in a directory.
+/// Returns 0 if the directory does not exist or cannot be read.
+fn dir_size(path: &Path) -> u64 {
+    fn walk(path: &Path, total: &mut u64) {
+        let entries = match std::fs::read_dir(path) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_file() {
+                *total += meta.len();
+            } else if meta.is_dir() {
+                walk(&entry.path(), total);
             }
         }
     }
 
-    Some(IoStat {
-        read_bytes,
-        write_bytes,
-    })
+    let mut total = 0;
+    walk(path, &mut total);
+    total
 }
 
 #[cfg(test)]
@@ -285,27 +283,6 @@ fn parse_cpu_stat(content: &str) -> Option<CpuStat> {
 }
 
 #[cfg(test)]
-fn parse_io_stat(content: &str) -> Option<IoStat> {
-    let mut read_bytes = 0u64;
-    let mut write_bytes = 0u64;
-
-    for line in content.lines() {
-        for field in line.split_whitespace() {
-            if let Some(val) = field.strip_prefix("rbytes=") {
-                read_bytes += val.parse::<u64>().unwrap_or(0);
-            } else if let Some(val) = field.strip_prefix("wbytes=") {
-                write_bytes += val.parse::<u64>().unwrap_or(0);
-            }
-        }
-    }
-
-    Some(IoStat {
-        read_bytes,
-        write_bytes,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -330,8 +307,7 @@ mod tests {
             avg_memory_bytes: 858993459,
             cpu_user_usec: 38_100_000,
             cpu_sys_usec: 2_400_000,
-            io_read_bytes: 536_870_912,
-            io_write_bytes: 12_897_484,
+            peak_spill_bytes: 536_870_912,
             sample_count: 42,
         };
         let output = stats.to_string();
@@ -340,8 +316,7 @@ mod tests {
         assert!(output.contains("| Avg memory |"));
         assert!(output.contains("| CPU user | 38.1s |"));
         assert!(output.contains("| CPU sys | 2.4s |"));
-        assert!(output.contains("| Disk read | 512.0 MiB |"));
-        assert!(output.contains("| Disk write | 12.3 MiB |"));
+        assert!(output.contains("| Peak spill | 512.0 MiB |"));
     }
 
     #[test]
@@ -367,19 +342,16 @@ throttled_usec 0
     }
 
     #[test]
-    fn test_parse_io_stat() {
-        let content = "259:0 rbytes=1048576 wbytes=524288 rios=100 wios=50 dbytes=0 dios=0\n\
-                        259:1 rbytes=2097152 wbytes=1048576 rios=200 wios=100 dbytes=0 dios=0\n";
-        let stat = parse_io_stat(content).unwrap();
-        assert_eq!(stat.read_bytes, 1048576 + 2097152);
-        assert_eq!(stat.write_bytes, 524288 + 1048576);
-    }
-
-    #[test]
-    fn test_parse_io_stat_empty() {
-        let stat = parse_io_stat("").unwrap();
-        assert_eq!(stat.read_bytes, 0);
-        assert_eq!(stat.write_bytes, 0);
+    fn test_dir_size() {
+        let tmp = std::env::temp_dir().join("test_dir_size_monitor");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::write(tmp.join("sub/b.bin"), vec![0u8; 2048]).unwrap();
+        assert_eq!(dir_size(&tmp), 3072);
+        // Non-existent directory returns 0
+        assert_eq!(dir_size(Path::new("/nonexistent/path")), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -395,7 +367,7 @@ throttled_usec 0
 
     #[tokio::test]
     async fn test_monitor_returns_stats() {
-        let monitor = CgroupMonitor::start();
+        let monitor = CgroupMonitor::start(None);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stats = monitor.finish().await;
         assert!(stats.wall_time >= Duration::from_millis(50));
