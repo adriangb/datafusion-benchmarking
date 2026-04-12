@@ -57,12 +57,69 @@ Or run specific benchmarks:
 run benchmark tpch_mem clickbench_partitioned
 ```
 
-With environment variables:
+### Comparing specific branches or commits
 
+By default, benchmarks compare the PR's merge base (baseline) against the PR head (changed). You can override either side with any git ref (branch, tag, or commit SHA):
+
+```yaml
+run benchmark tpch
+baseline:
+  ref: v45.0.0
+changed:
+  ref: v46.0.0
 ```
-run benchmark tpch_mem
-DATAFUSION_RUNTIME_MEMORY_LIMIT=1G
+
+You can also set just one side and leave the other as the default:
+
+```yaml
+run benchmark tpch
+baseline:
+  ref: main
 ```
+
+### Per-side environment variables
+
+Environment variables can be set at three levels:
+
+**Shared** (applies to both baseline and changed):
+
+```yaml
+run benchmark tpch
+env:
+  RUST_LOG: debug
+```
+
+**Per-side** (different values for baseline vs changed):
+
+```yaml
+run benchmark tpch
+baseline:
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G
+changed:
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G
+```
+
+**Combined** (shared + per-side + custom refs):
+
+```yaml
+run benchmark tpch clickbench_1
+env:
+  RUST_LOG: debug
+baseline:
+  ref: v45.0.0
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G
+changed:
+  ref: v46.0.0
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G
+```
+
+Per-side env vars override shared env vars when both set the same key.
+
+### View the queue
 
 View the queue:
 
