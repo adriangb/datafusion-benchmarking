@@ -33,6 +33,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     // If a custom changed ref is specified, checkout that instead of PR head
     if let Some(ref changed_ref) = config.changed_ref {
         info!(changed_ref, "=== Checking out custom changed ref ===");
+        git::fetch_pr_ref(&config.pr_url, &branch_dir).await?;
         git::fetch_origin(&branch_dir).await?;
         git::checkout(&branch_dir, changed_ref).await?;
     }
@@ -43,6 +44,7 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     git::clone_shallow(&repo_url, &base_dir, 200).await?;
     if let Some(ref baseline_ref) = config.baseline_ref {
         info!(baseline_ref, "=== Checking out custom baseline ref ===");
+        git::fetch_pr_ref(&config.pr_url, &base_dir).await?;
         git::fetch_origin(&base_dir).await?;
         git::checkout(&base_dir, baseline_ref).await?;
         baseline_display = baseline_ref.clone();
