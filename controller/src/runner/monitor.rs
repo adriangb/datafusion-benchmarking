@@ -55,7 +55,11 @@ impl fmt::Display for ResourceStats {
             "| CPU sys | {:.1}s |",
             self.cpu_sys_usec as f64 / 1_000_000.0
         )?;
-        write!(f, "| Peak spill | {} |", format_bytes(self.peak_spill_bytes))
+        write!(
+            f,
+            "| Peak spill | {} |",
+            format_bytes(self.peak_spill_bytes)
+        )
     }
 }
 

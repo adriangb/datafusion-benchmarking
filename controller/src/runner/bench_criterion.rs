@@ -140,7 +140,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
         }
         let baseline_extra_env = config.baseline_env_args();
         let (_, stats) = if baseline_extra_env.is_empty() {
-            shell::run_command_monitored("cargo", &str_slice(&base_run_args), &base_dir, None).await?
+            shell::run_command_monitored("cargo", &str_slice(&base_run_args), &base_dir, None)
+                .await?
         } else {
             let mut env_args: Vec<String> = baseline_extra_env;
             env_args.push("cargo".to_string());
@@ -162,7 +163,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
     }
     let changed_extra_env = config.changed_env_args();
     let (_, branch_stats) = if changed_extra_env.is_empty() {
-        shell::run_command_monitored("cargo", &str_slice(&branch_run_args), &branch_dir, None).await?
+        shell::run_command_monitored("cargo", &str_slice(&branch_run_args), &branch_dir, None)
+            .await?
     } else {
         let mut env_args: Vec<String> = changed_extra_env;
         env_args.push("cargo".to_string());

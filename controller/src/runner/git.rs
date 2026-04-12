@@ -109,11 +109,7 @@ pub async fn fetch_pr_ref(pr_url: &str, dir: &Path) -> Result<()> {
 
     run_command(
         "git",
-        &[
-            "fetch",
-            "origin",
-            &format!("refs/pull/{pr_number}/head"),
-        ],
+        &["fetch", "origin", &format!("refs/pull/{pr_number}/head")],
         dir,
     )
     .await
