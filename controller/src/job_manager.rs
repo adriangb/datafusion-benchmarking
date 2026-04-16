@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, EphemeralVolumeSource, PersistentVolumeClaimTemplate, PodSpec,
-    PodTemplateSpec, ResourceRequirements, SecretKeySelector, Toleration, Volume, VolumeMount,
+    PodTemplateSpec, ResourceRequirements, SeccompProfile, SecretKeySelector, SecurityContext,
+    Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -417,6 +418,13 @@ async fn create_k8s_job(
                             mount_path: "/workspace".into(),
                             ..Default::default()
                         }]),
+                        security_context: Some(SecurityContext {
+                            seccomp_profile: Some(SeccompProfile {
+                                type_: "Localhost".into(),
+                                localhost_profile: Some("profiles/io-uring-allowed.json".into()),
+                            }),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     }],
                     volumes: Some(vec![Volume {

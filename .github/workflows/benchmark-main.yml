@@ -65,6 +65,10 @@ jobs:
                 containers:
                   - name: runner
                     image: ${{ env.REGISTRY }}/runner:latest
+                    securityContext:
+                      seccompProfile:
+                        type: Localhost
+                        localhostProfile: profiles/io-uring-allowed.json
                     env:
                       - name: BENCH_TYPE
                         value: main_tracking
