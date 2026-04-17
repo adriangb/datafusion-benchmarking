@@ -173,11 +173,7 @@ impl CgroupMonitor {
         let peak = self.peak_memory.load(Ordering::Relaxed).max(end_memory);
         let total_sum = self.memory_sum.load(Ordering::Relaxed) + end_memory;
         let total_count = self.sample_count.load(Ordering::Relaxed) + 1;
-        let avg = if total_count > 0 {
-            total_sum / total_count
-        } else {
-            0
-        };
+        let avg = total_sum.checked_div(total_count).unwrap_or(0);
 
         let (cpu_user, cpu_sys) = match (self.start_cpu, end_cpu) {
             (Some(start), Some(end)) => (
