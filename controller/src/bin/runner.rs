@@ -6,8 +6,9 @@
 use anyhow::Result;
 use tracing::{error, info};
 
-use benchmark_controller::github::{self, GitHubClient};
+use benchmark_controller::github;
 use benchmark_controller::runner::config::{BenchType, RunnerConfig};
+use benchmark_controller::runner::poster::CommentPoster;
 use benchmark_controller::runner::{bench_arrow, bench_criterion, bench_standard, shell};
 
 #[tokio::main]
@@ -43,11 +44,11 @@ async fn main() {
         "starting benchmark runner"
     );
 
-    let gh = GitHubClient::new(&config.github_token);
+    let poster = config.build_poster();
 
-    if let Err(e) = run_benchmark(&config, &gh).await {
+    if let Err(e) = run_benchmark(&config, &poster).await {
         error!(error = %e, "benchmark failed");
-        post_error_comment(&config, &gh).await;
+        post_error_comment(&config, &poster).await;
         std::process::exit(1);
     }
 
@@ -55,15 +56,15 @@ async fn main() {
     shell::log_sccache_stats().await;
 }
 
-async fn run_benchmark(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
+async fn run_benchmark(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     match config.bench_type {
-        BenchType::Standard | BenchType::MainTracking => bench_standard::run(config, gh).await,
-        BenchType::Criterion => bench_criterion::run(config, gh).await,
-        BenchType::ArrowCriterion => bench_arrow::run(config, gh).await,
+        BenchType::Standard | BenchType::MainTracking => bench_standard::run(config, poster).await,
+        BenchType::Criterion => bench_criterion::run(config, poster).await,
+        BenchType::ArrowCriterion => bench_arrow::run(config, poster).await,
     }
 }
 
-async fn post_error_comment(config: &RunnerConfig, gh: &GitHubClient) {
+async fn post_error_comment(config: &RunnerConfig, poster: &CommentPoster) {
     let tail = shell::tail_log(20).await;
 
     let footer = github::issues_footer(config.runner_repo_url.as_deref());
@@ -86,7 +87,7 @@ async fn post_error_comment(config: &RunnerConfig, gh: &GitHubClient) {
         }
     };
 
-    if let Err(e) = gh.post_comment(&config.repo, pr_number, &body).await {
+    if let Err(e) = poster.post_comment(&config.repo, pr_number, &body).await {
         error!(error = %e, "failed to post error comment");
     }
 }

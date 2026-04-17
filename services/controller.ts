@@ -127,6 +127,22 @@ const imageTag = config.get("imageTag") || "latest";
 const controllerImage = pulumi.interpolate`${registryUrl}/controller:${imageTag}`;
 const runnerImage = pulumi.interpolate`${registryUrl}/runner:${imageTag}`;
 
+// ClusterIP Service so benchmark runner pods can reach the controller's
+// comment-proxy endpoint at
+// http://benchmark-controller.benchmarking.svc.cluster.local:8080.
+const controllerService = new k8s.core.v1.Service("benchmark-controller", {
+  metadata: {
+    name: "benchmark-controller",
+    namespace: "benchmarking",
+    labels: { app: "benchmark-controller" },
+  },
+  spec: {
+    selector: { app: "benchmark-controller" },
+    ports: [{ name: "http", port: 8080, targetPort: 8080, protocol: "TCP" }],
+    type: "ClusterIP",
+  },
+}, { provider: k8sProvider, dependsOn: [ns] });
+
 export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-controller", {
   metadata: {
     name: "benchmark-controller",

@@ -12,7 +12,7 @@ use crate::benchmarks::{
     allowed_users_markdown, detect_benchmark, is_benchmark_trigger, is_queue_request,
     is_singular_no_names, supported_benchmarks_message, DetectResult,
 };
-use crate::config::{BenchmarkConfig, Config, RepoEntry};
+use crate::config::{BenchmarkConfig, Config, RepoEntry, MAX_QUEUED_PER_USER};
 use crate::db;
 use crate::github::{self, GitHubClient};
 use crate::models::{GitHubComment, JobInsert};
@@ -131,6 +131,24 @@ fn not_allowed_message(
          Only whitelisted users can trigger benchmarks. \
          Allowed users: {}.{footer}",
         allowed_users_markdown(allowed_users)
+    )
+}
+
+/// Build the reply posted when a user would exceed the per-user queued-jobs cap.
+fn rate_limit_message(
+    login: &str,
+    comment_url: &str,
+    pending: i64,
+    incoming: i64,
+    runner_repo_url: Option<&str>,
+) -> String {
+    let footer = github::issues_footer(runner_repo_url);
+    format!(
+        "Hi @{login}, thanks for the request ({comment_url}). \
+         You already have {pending} pending benchmark job(s), and this request \
+         would add {incoming} more — exceeding the per-user queue limit of \
+         {MAX_QUEUED_PER_USER}. Please wait for some of your current runs to \
+         finish before submitting more.{footer}"
     )
 }
 
@@ -262,6 +280,24 @@ async fn process_comment(
 
     info!(pr_number, login, benchmarks = ?request.benchmarks, "scheduling benchmark");
 
+    // Resolve default benchmarks when "run benchmarks" is used without specific names
+    let benchmarks = if request.benchmarks.is_empty() {
+        repo_entry.default_standard.clone()
+    } else {
+        request.benchmarks.clone()
+    };
+
+    // Per-user queued-jobs cap. One comment can insert multiple jobs (one per
+    // benchmark name); count them all against the cap before inserting any.
+    let incoming = benchmarks.len().max(1) as i64;
+    let pending = db::count_user_pending(pool, login).await?;
+    if pending + incoming > MAX_QUEUED_PER_USER {
+        let msg = rate_limit_message(login, comment_url, pending, incoming, runner_repo_url);
+        gh.post_comment(repo, pr_number, &msg).await?;
+        mark_seen(pool, comment, repo, pr_number).await?;
+        return Ok(());
+    }
+
     // Mark seen before insert_job — the FK on benchmark_jobs requires the
     // seen_comments row to exist first.
     mark_seen(pool, comment, repo, pr_number).await?;
@@ -270,13 +306,6 @@ async fn process_comment(
     let env_vars_json = serde_json::to_string(&request.env_vars)?;
     let baseline_env_json = serde_json::to_string(&request.baseline_env_vars)?;
     let changed_env_json = serde_json::to_string(&request.changed_env_vars)?;
-
-    // Resolve default benchmarks when "run benchmarks" is used without specific names
-    let benchmarks = if request.benchmarks.is_empty() {
-        repo_entry.default_standard.clone()
-    } else {
-        request.benchmarks.clone()
-    };
 
     // Determine job type(s) and insert jobs
     if benchmarks.is_empty() {
@@ -423,6 +452,16 @@ mod tests {
         assert!(msg.contains("whitelisted") || msg.contains("Whitelisted"));
     }
 
+    #[test]
+    fn rate_limit_msg_contains_fields() {
+        let msg = rate_limit_message("alice", "https://example.com/c/9", 12, 4, None);
+        assert!(msg.contains("@alice"));
+        assert!(msg.contains("https://example.com/c/9"));
+        assert!(msg.contains("12 pending"));
+        assert!(msg.contains("would add 4"));
+        assert!(msg.contains("per-user queue limit of 15"));
+    }
+
     // ── format_queue_message ────────────────────────────────────────
 
     #[test]
@@ -455,6 +494,7 @@ mod tests {
             error_message: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
+            runner_token: None,
         };
         let msg = format_queue_message("bob", "https://example.com/c/2", &[job]);
         assert!(msg.contains("| Comment |"));

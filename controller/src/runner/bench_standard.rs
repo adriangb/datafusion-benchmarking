@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::info;
 
-use crate::github::{self, GitHubClient};
+use crate::github;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
+use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
 
 /// Run standard bench.sh benchmarks comparing a PR branch to its merge-base.
-pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
+pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     let repo_url = config.repo_url();
     let benchmarks = &config.benchmarks;
 
@@ -103,7 +104,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
         config.comment_url,
         repo = config.repo,
     );
-    gh.post_comment(&config.repo, pr_number, &running_body)
+    poster
+        .post_comment(&config.repo, pr_number, &running_body)
         .await?;
 
     // Wait for builds
@@ -232,7 +234,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
         &lscpu,
         &footer,
     );
-    gh.post_comment(&config.repo, pr_number, &result_body)
+    poster
+        .post_comment(&config.repo, pr_number, &result_body)
         .await?;
 
     Ok(())

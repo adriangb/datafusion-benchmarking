@@ -1,12 +1,19 @@
 //! Runner environment variable parsing.
 //!
-//! The controller passes these env vars to the runner K8s pod (see `job_manager.rs`):
-//! `PR_URL`, `COMMENT_ID`, `BENCHMARKS`, `BENCH_TYPE`, `BENCH_NAME`,
-//! `BENCH_FILTER`, `REPO`, `GITHUB_TOKEN`, `JOB_NAME`, `RUNNER_REPO_URL`.
+//! The controller passes these env vars to PR-triggered runner pods (see
+//! `job_manager.rs`): `PR_URL`, `COMMENT_ID`, `BENCHMARKS`, `BENCH_TYPE`,
+//! `BENCH_NAME`, `BENCH_FILTER`, `REPO`, `JOB_ID`, `RUNNER_TOKEN`,
+//! `CONTROLLER_URL`, `RUNNER_REPO_URL`. The scheduled main-tracking
+//! workflow instead supplies `GITHUB_TOKEN` directly (no PR author to
+//! distrust).
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+
+use crate::github::GitHubClient;
+use crate::runner::controller_client::ControllerClient;
+use crate::runner::poster::CommentPoster;
 
 /// Benchmark runner variant, parsed from `BENCH_TYPE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +36,22 @@ impl BenchType {
     }
 }
 
+/// How PR comments should be posted from this runner.
+#[derive(Debug, Clone)]
+pub enum PosterMode {
+    /// Direct-to-GitHub with a `GITHUB_TOKEN`. Used by the scheduled
+    /// main-tracking workflow where the code under benchmark is trusted.
+    Direct { github_token: String },
+    /// Proxy through the controller. Used by PR-triggered runs so the pod
+    /// never sees any GitHub credential. The controller authenticates the
+    /// runner with `token` and looks up the job by `job_id`.
+    Proxy {
+        controller_url: String,
+        job_id: String,
+        token: String,
+    },
+}
+
 /// Parsed runner configuration from environment variables.
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -40,7 +63,7 @@ pub struct RunnerConfig {
     pub bench_name: String,
     pub bench_filter: String,
     pub repo: String,
-    pub github_token: String,
+    pub poster_mode: PosterMode,
     pub sccache_gcs_bucket: Option<String>,
     pub data_cache_bucket: Option<String>,
     pub baseline_env_vars: HashMap<String, String>,
@@ -77,7 +100,7 @@ impl RunnerConfig {
             bench_name: env_or("BENCH_NAME", "sql_planner"),
             bench_filter: env_or("BENCH_FILTER", ""),
             repo: env_required("REPO")?,
-            github_token: env_required("GITHUB_TOKEN")?,
+            poster_mode: parse_poster_mode()?,
             sccache_gcs_bucket: std::env::var("SCCACHE_GCS_BUCKET").ok(),
             data_cache_bucket: std::env::var("DATA_CACHE_BUCKET").ok(),
             baseline_env_vars,
@@ -86,6 +109,24 @@ impl RunnerConfig {
             changed_ref: std::env::var("CHANGED_REF").ok(),
             runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
         })
+    }
+
+    /// Build the [`CommentPoster`] implied by [`Self::poster_mode`].
+    pub fn build_poster(&self) -> CommentPoster {
+        match &self.poster_mode {
+            PosterMode::Direct { github_token } => {
+                CommentPoster::Direct(GitHubClient::new(github_token))
+            }
+            PosterMode::Proxy {
+                controller_url,
+                job_id,
+                token,
+            } => CommentPoster::Proxy(ControllerClient::new(
+                controller_url.clone(),
+                job_id.clone(),
+                token.clone(),
+            )),
+        }
     }
 
     /// The repo clone URL.
@@ -138,6 +179,32 @@ fn env_required(key: &str) -> Result<String> {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Pick the poster mode based on which env vars are set. Proxy mode is
+/// preferred when both are available — in practice only one set will be
+/// present in any given pod.
+fn parse_poster_mode() -> Result<PosterMode> {
+    let runner_token = std::env::var("RUNNER_TOKEN").ok();
+    let controller_url = std::env::var("CONTROLLER_URL").ok();
+    let job_id = std::env::var("JOB_ID").ok();
+
+    if let (Some(token), Some(url), Some(id)) = (runner_token, controller_url, job_id) {
+        return Ok(PosterMode::Proxy {
+            controller_url: url,
+            job_id: id,
+            token,
+        });
+    }
+
+    if let Ok(github_token) = std::env::var("GITHUB_TOKEN") {
+        return Ok(PosterMode::Direct { github_token });
+    }
+
+    anyhow::bail!(
+        "missing credentials: set RUNNER_TOKEN+CONTROLLER_URL+JOB_ID (proxy mode) \
+         or GITHUB_TOKEN (direct mode)"
+    );
 }
 
 #[cfg(test)]

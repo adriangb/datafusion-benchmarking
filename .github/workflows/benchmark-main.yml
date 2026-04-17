@@ -67,8 +67,11 @@ jobs:
                     image: ${{ env.REGISTRY }}/runner:latest
                     securityContext:
                       seccompProfile:
-                        type: Localhost
-                        localhostProfile: profiles/io-uring-allowed.json
+                        # Unconfined so the DataFusion runner can use
+                        # io_uring (blocked by the default containerd seccomp
+                        # profile). Justified here because the main-tracking
+                        # workflow runs trusted apache/datafusion main.
+                        type: Unconfined
                     env:
                       - name: BENCH_TYPE
                         value: main_tracking

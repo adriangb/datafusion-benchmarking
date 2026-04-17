@@ -54,6 +54,10 @@ pub struct BenchmarkJob {
     pub error_message: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Random per-job token the runner uses to authenticate its
+    /// `POST /jobs/{id}/comment` calls against the controller. `None` for
+    /// legacy rows created before migration 003.
+    pub runner_token: Option<String>,
 }
 
 /// Parsed user intent from a PR comment (e.g. `run benchmark tpch_mem`).

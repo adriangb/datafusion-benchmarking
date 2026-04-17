@@ -8,6 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::str::FromStr;
 
+use crate::config::MAX_RUNNING_PER_USER;
 use crate::models::{BenchmarkJob, JobInsert, JobStatus};
 
 /// Open (or create) the SQLite database and run migrations. Uses WAL journal mode.
@@ -85,15 +86,61 @@ pub async fn insert_job(pool: &SqlitePool, job: &JobInsert<'_>) -> Result<i64> {
     Ok(result.last_insert_rowid())
 }
 
-/// Return up to 5 oldest `pending` jobs, ordered by ID.
+/// Return up to 5 oldest `pending` jobs, ordered by ID. Skips jobs whose
+/// author already has `MAX_RUNNING_PER_USER` running jobs — those stay
+/// pending until an earlier run finishes.
 #[tracing::instrument(skip(pool))]
 pub async fn get_pending_jobs(pool: &SqlitePool) -> Result<Vec<BenchmarkJob>> {
     let jobs = sqlx::query_as::<_, BenchmarkJob>(
-        "SELECT * FROM benchmark_jobs WHERE status = 'pending' ORDER BY id LIMIT 5",
+        "SELECT * FROM benchmark_jobs p \
+         WHERE p.status = 'pending' \
+           AND (SELECT COUNT(*) FROM benchmark_jobs r \
+                WHERE r.login = p.login AND r.status = 'running') < ? \
+         ORDER BY p.id LIMIT 5",
     )
+    .bind(MAX_RUNNING_PER_USER)
     .fetch_all(pool)
     .await?;
     Ok(jobs)
+}
+
+/// Count a user's currently-pending benchmark jobs. Used to enforce the
+/// per-user queued-jobs cap at ingestion time.
+pub async fn count_user_pending(pool: &SqlitePool, login: &str) -> Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM benchmark_jobs WHERE login = ? AND status = 'pending'",
+    )
+    .bind(login)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Store the per-job runner token on a benchmark row.
+pub async fn set_runner_token(pool: &SqlitePool, job_id: i64, token: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE benchmark_jobs SET runner_token = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(token)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Look up a running job by id and return its stored runner token, repo, and
+/// PR number. Returns `None` if the job doesn't exist.
+pub async fn get_job_for_comment(
+    pool: &SqlitePool,
+    job_id: i64,
+) -> Result<Option<(String, i64, String, Option<String>)>> {
+    let row = sqlx::query_as::<_, (String, i64, String, Option<String>)>(
+        "SELECT repo, pr_number, status, runner_token FROM benchmark_jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 /// Return all jobs with status `running`.
@@ -280,6 +327,99 @@ mod tests {
         }
         let pending = get_pending_jobs(&pool).await.unwrap();
         assert_eq!(pending.len(), 5);
+    }
+
+    // ── get_pending_jobs: per-user running-cap filter ─────────────
+
+    #[tokio::test]
+    async fn get_pending_skips_user_at_running_cap() {
+        let pool = test_pool().await;
+
+        // alice has 5 running jobs — her pending jobs should be skipped.
+        for i in 0..5 {
+            let cid = 900 + i;
+            mark_comment_seen(&pool, cid, "apache/datafusion", 42, "alice", "2024-01-01")
+                .await
+                .unwrap();
+            let id = insert_job(&pool, &test_job(cid)).await.unwrap();
+            update_job_status(&pool, id, JobStatus::Running, Some("k"), None)
+                .await
+                .unwrap();
+        }
+        // alice has a pending job waiting
+        mark_comment_seen(&pool, 910, "apache/datafusion", 42, "alice", "2024-01-01")
+            .await
+            .unwrap();
+        insert_job(&pool, &test_job(910)).await.unwrap();
+
+        // bob has a pending job — should still be picked up
+        let mut bob_job = test_job(920);
+        bob_job.login = "bob";
+        mark_comment_seen(&pool, 920, "apache/datafusion", 42, "bob", "2024-01-01")
+            .await
+            .unwrap();
+        insert_job(&pool, &bob_job).await.unwrap();
+
+        let pending = get_pending_jobs(&pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].login, "bob");
+    }
+
+    // ── count_user_pending ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn count_user_pending_groups_by_login_and_status() {
+        let pool = test_pool().await;
+
+        for i in 0..3 {
+            let cid = 1000 + i;
+            mark_comment_seen(&pool, cid, "apache/datafusion", 42, "alice", "2024-01-01")
+                .await
+                .unwrap();
+            insert_job(&pool, &test_job(cid)).await.unwrap();
+        }
+        // one of alice's jobs is running, not pending
+        mark_comment_seen(&pool, 1100, "apache/datafusion", 42, "alice", "2024-01-01")
+            .await
+            .unwrap();
+        let running_id = insert_job(&pool, &test_job(1100)).await.unwrap();
+        update_job_status(&pool, running_id, JobStatus::Running, Some("k"), None)
+            .await
+            .unwrap();
+
+        // bob has one pending job — should not be counted for alice
+        let mut bob_job = test_job(1200);
+        bob_job.login = "bob";
+        mark_comment_seen(&pool, 1200, "apache/datafusion", 42, "bob", "2024-01-01")
+            .await
+            .unwrap();
+        insert_job(&pool, &bob_job).await.unwrap();
+
+        assert_eq!(count_user_pending(&pool, "alice").await.unwrap(), 3);
+        assert_eq!(count_user_pending(&pool, "bob").await.unwrap(), 1);
+        assert_eq!(count_user_pending(&pool, "nobody").await.unwrap(), 0);
+    }
+
+    // ── set_runner_token + get_job_for_comment ─────────────────
+
+    #[tokio::test]
+    async fn runner_token_roundtrip() {
+        let pool = test_pool().await;
+        mark_comment_seen(&pool, 2000, "apache/datafusion", 42, "alice", "2024-01-01")
+            .await
+            .unwrap();
+        let id = insert_job(&pool, &test_job(2000)).await.unwrap();
+
+        set_runner_token(&pool, id, "secret-abc").await.unwrap();
+
+        let (repo, pr, status, token) = get_job_for_comment(&pool, id).await.unwrap().unwrap();
+        assert_eq!(repo, "apache/datafusion");
+        assert_eq!(pr, 42);
+        assert_eq!(status, "pending");
+        assert_eq!(token.as_deref(), Some("secret-abc"));
+
+        // Missing job
+        assert!(get_job_for_comment(&pool, 99_999).await.unwrap().is_none());
     }
 
     // ── update_job_status + get_active_jobs ─────────────────────────

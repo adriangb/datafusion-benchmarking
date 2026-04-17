@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, EphemeralVolumeSource, PersistentVolumeClaimTemplate, PodSpec,
-    PodTemplateSpec, ResourceRequirements, SeccompProfile, SecretKeySelector, SecurityContext,
-    Toleration, Volume, VolumeMount,
+    PodTemplateSpec, ResourceRequirements, SeccompProfile, SecurityContext, Toleration, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -85,7 +85,16 @@ async fn reconcile_pending(
     let jobs_api: Api<Job> = Api::namespaced(kube.clone(), &config.k8s_namespace);
 
     for job in pending {
-        match create_k8s_job(config, &jobs_api, &job).await {
+        // Generate the per-job runner token before creating the pod so the
+        // token the pod ships with matches the row in SQLite. If the DB
+        // write fails we don't attempt to create the K8s Job.
+        let runner_token = generate_runner_token();
+        if let Err(e) = db::set_runner_token(pool, job.id, &runner_token).await {
+            warn!(comment_id = job.comment_id, error = %e, "failed to store runner token");
+            continue;
+        }
+
+        match create_k8s_job(config, &jobs_api, &job, &runner_token).await {
             Ok(k8s_name) => {
                 info!(comment_id = job.comment_id, k8s_name = %k8s_name, "created k8s job");
                 db::update_job_status(pool, job.id, JobStatus::Running, Some(&k8s_name), None)
@@ -199,16 +208,78 @@ fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
     }
 }
 
+/// Generate a random 32-byte hex token used to authenticate the runner
+/// pod to the controller's `POST /jobs/{id}/comment` endpoint. Uses tokio's
+/// `Instant` + process id + sqlx rowid entropy would be insufficient;
+/// instead we pull from the OS via `std::fs::read`.
+fn generate_runner_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Best-effort OS entropy; fall back to time-based mixing if /dev/urandom
+    // is unavailable (shouldn't happen on Linux nodes).
+    let mut buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut buf);
+    }
+    // Mix in the nanosecond timestamp so duplicate opens/races still differ.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte ^= ((now >> (i % 16 * 8)) & 0xff) as u8;
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Kubernetes DNS name for the controller service. Must match the Service
+/// defined in `services/controller.ts` (headless service `benchmark-controller`
+/// governing the StatefulSet). The controller listens on 8080 for health
+/// checks and the comment-proxy endpoint.
+fn controller_url(namespace: &str) -> String {
+    format!("http://benchmark-controller.{namespace}.svc.cluster.local:8080")
+}
+
+/// Coerce a GitHub login into a valid Kubernetes label value: lowercase
+/// alphanumerics and `-_.`, max 63 chars. Labels are for audit only; an
+/// unexpected char pattern gets silently squashed rather than failing the
+/// whole Job creation.
+fn sanitize_label(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(63);
+    // Labels must start and end with an alphanumeric.
+    let trimmed = out
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_string();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// Build and submit a K8s Job spec for a benchmark row.
 ///
 /// Resource defaults come from [`Config`]. Tolerates GKE spot instances.
 /// Uses an ephemeral volume at `/workspace` for build artifacts.
-/// `GITHUB_TOKEN` is injected from the `github-token` Secret.
-#[tracing::instrument(skip(config, jobs_api), fields(comment_id = job.comment_id, pr_number = job.pr_number))]
+/// The runner has no GitHub credentials — it proxies PR comments through the
+/// controller using `RUNNER_TOKEN` + `CONTROLLER_URL` + `JOB_ID`.
+#[tracing::instrument(skip(config, jobs_api, runner_token), fields(comment_id = job.comment_id, pr_number = job.pr_number))]
 async fn create_k8s_job(
     config: &Config,
     jobs_api: &Api<Job>,
     job: &BenchmarkJob,
+    runner_token: &str,
 ) -> Result<String> {
     let benchmarks: Vec<String> = serde_json::from_str(&job.benchmarks)?;
 
@@ -241,18 +312,11 @@ async fn create_k8s_job(
         env_var("BENCHMARKS", benchmarks.join(" ")),
         env_var("BENCH_TYPE", job.job_type.clone()),
         env_var("REPO", job.repo.clone()),
-        EnvVar {
-            name: "GITHUB_TOKEN".into(),
-            value_from: Some(EnvVarSource {
-                secret_key_ref: Some(SecretKeySelector {
-                    name: "github-token".into(),
-                    key: "token".into(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
+        // Runner posts comments via the controller proxy — no GitHub creds
+        // in the pod.
+        env_var("JOB_ID", job.id.to_string()),
+        env_var("RUNNER_TOKEN", runner_token),
+        env_var("CONTROLLER_URL", controller_url(&config.k8s_namespace)),
     ];
 
     // Add shared env vars directly on the pod (backward compat)
@@ -376,6 +440,7 @@ async fn create_k8s_job(
                 let mut l = BTreeMap::new();
                 l.insert("app".to_string(), "benchmark-runner".to_string());
                 l.insert("comment-id".to_string(), job.comment_id.to_string());
+                l.insert("triggered-by".to_string(), sanitize_label(&job.login));
                 l
             }),
             ..Default::default()
@@ -418,10 +483,18 @@ async fn create_k8s_job(
                             mount_path: "/workspace".into(),
                             ..Default::default()
                         }]),
+                        // Unconfined seccomp: GKE Autopilot rejects custom
+                        // node-side seccomp profiles, and DataFusion's
+                        // io_uring-based file I/O needs the `io_uring_*`
+                        // syscalls that the default runtime profile blocks.
+                        // Workload is already isolated via namespaces,
+                        // cgroups, non-privileged containers, and dropped
+                        // NET_RAW (see below); comments are proxied through
+                        // the controller so the pod has no GitHub creds.
                         security_context: Some(SecurityContext {
                             seccomp_profile: Some(SeccompProfile {
-                                type_: "Localhost".into(),
-                                localhost_profile: Some("profiles/io-uring-allowed.json".into()),
+                                type_: "Unconfined".into(),
+                                localhost_profile: None,
                             }),
                             ..Default::default()
                         }),
@@ -464,4 +537,39 @@ async fn create_k8s_job(
 
     jobs_api.create(&PostParams::default(), &k8s_job).await?;
     Ok(job_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_label_lowercases_and_replaces_bad_chars() {
+        assert_eq!(sanitize_label("Alice"), "alice");
+        assert_eq!(sanitize_label("user@github"), "user-github");
+    }
+
+    #[test]
+    fn sanitize_label_trims_to_63() {
+        let long = "x".repeat(80);
+        let out = sanitize_label(&long);
+        assert!(out.len() <= 63);
+        assert_eq!(&out, &long[..63]);
+    }
+
+    #[test]
+    fn sanitize_label_empty_falls_back() {
+        assert_eq!(sanitize_label(""), "unknown");
+        assert_eq!(sanitize_label("@@@"), "unknown");
+    }
+
+    #[test]
+    fn runner_token_is_64_hex_chars() {
+        let tok = generate_runner_token();
+        assert_eq!(tok.len(), 64);
+        assert!(tok.chars().all(|c| c.is_ascii_hexdigit()));
+        // Very unlikely to repeat.
+        let tok2 = generate_runner_token();
+        assert_ne!(tok, tok2);
+    }
 }

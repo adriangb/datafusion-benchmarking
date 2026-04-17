@@ -5,6 +5,16 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Maximum benchmark jobs a single user can have in the `running` state at once.
+/// Enforced at pickup in `db::get_pending_jobs`, so pending jobs sit in the
+/// queue until an earlier run finishes.
+pub const MAX_RUNNING_PER_USER: i64 = 5;
+
+/// Maximum benchmark jobs a single user can have in the `pending` state at once.
+/// Enforced at ingestion in `github_poller::process_comment`; the user is told
+/// to wait instead of silently dropping the request.
+pub const MAX_QUEUED_PER_USER: i64 = 15;
+
 /// Per-repo benchmark allowlists loaded from JSON config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoEntry {

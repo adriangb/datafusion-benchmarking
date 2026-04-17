@@ -5,14 +5,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::github::{self, GitHubClient};
+use crate::github;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor;
+use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
 
 /// Run a criterion benchmark comparing a PR branch to its merge-base.
-pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
+pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     let repo_url = config.repo_url();
     let bench_name = &config.bench_name;
     let bench_filter = &config.bench_filter;
@@ -90,7 +91,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
         repo = config.repo,
     );
     let pr_number = config.pr_number()?;
-    gh.post_comment(&config.repo, pr_number, &running_body)
+    poster
+        .post_comment(&config.repo, pr_number, &running_body)
         .await?;
 
     // Compile both in parallel
@@ -212,7 +214,8 @@ pub async fn run(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
             &footer,
         )
     };
-    gh.post_comment(&config.repo, pr_number, &result_body)
+    poster
+        .post_comment(&config.repo, pr_number, &result_body)
         .await?;
 
     Ok(())
