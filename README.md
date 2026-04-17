@@ -146,6 +146,9 @@ show benchmark queue
 | `smj` | Sort-merge join |
 | `sort_pushdown` | Sort pushdown |
 | `sort_pushdown_sorted` | Sort pushdown sorted |
+| `sort_pushdown_inexact` | Sort pushdown inexact |
+| `sort_pushdown_inexact_unsorted` | Sort pushdown inexact unsorted |
+| `sort_pushdown_inexact_overlap` | Sort pushdown inexact overlap |
 
 ### DataFusion (criterion)
 
