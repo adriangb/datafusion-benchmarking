@@ -152,10 +152,12 @@ async fn handle_job_comment(
         return Ok(CONFLICT.to_vec());
     }
 
-    // Parse body: {"body": "<markdown>"}
+    // Parse body: {"body": "<markdown>"}. `body` must be `String`, not
+    // `&str`: comment bodies contain `\n` etc. which require unescaping
+    // and can't be zero-copy borrowed out of the source bytes.
     #[derive(serde::Deserialize)]
-    struct CommentReq<'a> {
-        body: &'a str,
+    struct CommentReq {
+        body: String,
     }
     let payload: CommentReq = match serde_json::from_slice(&req.body) {
         Ok(p) => p,
@@ -165,7 +167,7 @@ async fn handle_job_comment(
         return Ok(BAD_REQUEST.to_vec());
     }
 
-    gh.post_comment(&repo, pr_number, payload.body).await?;
+    gh.post_comment(&repo, pr_number, &payload.body).await?;
     Ok(OK.to_vec())
 }
 

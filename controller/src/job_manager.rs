@@ -94,7 +94,19 @@ async fn reconcile_pending(
             continue;
         }
 
-        match create_k8s_job(config, &jobs_api, &job, &runner_token).await {
+        // Resolve the PR's source branch here so the runner pod (which has
+        // no GitHub credentials) doesn't need to call `gh pr view`. A
+        // lookup failure is not fatal — we fall back to an empty value and
+        // the runner will error cleanly if it actually needs it.
+        let pr_head_ref = match gh.get_pr_head_ref(&job.repo, job.pr_number).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(comment_id = job.comment_id, error = %e, "failed to resolve PR head ref");
+                String::new()
+            }
+        };
+
+        match create_k8s_job(config, &jobs_api, &job, &runner_token, &pr_head_ref).await {
             Ok(k8s_name) => {
                 info!(comment_id = job.comment_id, k8s_name = %k8s_name, "created k8s job");
                 db::update_job_status(pool, job.id, JobStatus::Running, Some(&k8s_name), None)
@@ -274,12 +286,13 @@ fn sanitize_label(s: &str) -> String {
 /// Uses an ephemeral volume at `/workspace` for build artifacts.
 /// The runner has no GitHub credentials — it proxies PR comments through the
 /// controller using `RUNNER_TOKEN` + `CONTROLLER_URL` + `JOB_ID`.
-#[tracing::instrument(skip(config, jobs_api, runner_token), fields(comment_id = job.comment_id, pr_number = job.pr_number))]
+#[tracing::instrument(skip(config, jobs_api, runner_token, pr_head_ref), fields(comment_id = job.comment_id, pr_number = job.pr_number))]
 async fn create_k8s_job(
     config: &Config,
     jobs_api: &Api<Job>,
     job: &BenchmarkJob,
     runner_token: &str,
+    pr_head_ref: &str,
 ) -> Result<String> {
     let benchmarks: Vec<String> = serde_json::from_str(&job.benchmarks)?;
 
@@ -318,6 +331,13 @@ async fn create_k8s_job(
         env_var("RUNNER_TOKEN", runner_token),
         env_var("CONTROLLER_URL", controller_url(&config.k8s_namespace)),
     ];
+
+    // The controller resolves the PR's source branch and hands it to the
+    // runner so `git.rs::checkout_pr` doesn't need `gh pr view` (which
+    // would require a GitHub token we no longer ship in the pod).
+    if !pr_head_ref.is_empty() {
+        env.push(env_var("PR_HEAD_REF", pr_head_ref));
+    }
 
     // Add shared env vars directly on the pod (backward compat)
     for (k, v) in &shared_env_vars {

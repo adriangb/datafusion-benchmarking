@@ -226,6 +226,26 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Look up a PR and return its `head.ref` (the source branch name).
+    /// Runner pods no longer have a `GITHUB_TOKEN`, so the controller
+    /// resolves this once and passes it to the pod via `PR_HEAD_REF`.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_pr_head_ref(&self, repo: &str, pr_number: i64) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct PullHead {
+            #[serde(rename = "ref")]
+            ref_: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pull {
+            head: PullHead,
+        }
+        let url = format!("{API_BASE}/repos/{repo}/pulls/{pr_number}");
+        let resp = self.get_with_retry(&url, &[]).await?;
+        let pull: Pull = resp.json().await.context("parse pull json")?;
+        Ok(pull.head.ref_)
+    }
+
     /// Add a reaction (e.g. "rocket") to a comment. Logs a warning on failure instead of erroring.
     pub async fn post_reaction(&self, repo: &str, comment_id: i64, content: &str) -> Result<()> {
         let url = format!("{API_BASE}/repos/{repo}/issues/comments/{comment_id}/reactions");
