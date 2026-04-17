@@ -182,7 +182,8 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                     "clickbench_partitioned", "clickbench_extended",
                     "clickbench_1", "clickbench_pushdown",
                     "external_aggr", "tpcds", "smj", "sort_pushdown",
-                    "sort_pushdown_sorted",
+                    "sort_pushdown_sorted", "sort_pushdown_inexact",
+                    "sort_pushdown_inexact_unsorted", "sort_pushdown_inexact_overlap",
                   ],
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
@@ -195,7 +196,8 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                     "clickbench_partitioned", "clickbench_extended",
                     "clickbench_1", "clickbench_pushdown",
                     "external_aggr", "tpcds", "smj", "sort_pushdown",
-                    "sort_pushdown_sorted",
+                    "sort_pushdown_sorted", "sort_pushdown_inexact",
+                    "sort_pushdown_inexact_unsorted", "sort_pushdown_inexact_overlap",
                   ],
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
