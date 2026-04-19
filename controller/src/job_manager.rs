@@ -330,6 +330,7 @@ async fn create_k8s_job(
         env_var("JOB_ID", job.id.to_string()),
         env_var("RUNNER_TOKEN", runner_token),
         env_var("CONTROLLER_URL", controller_url(&config.k8s_namespace)),
+        env_var("RUNNER_JOB_DEADLINE_SECS", config.active_deadline_secs.to_string()),
     ];
 
     // The controller resolves the PR's source branch and hands it to the

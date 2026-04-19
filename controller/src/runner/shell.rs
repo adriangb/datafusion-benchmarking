@@ -1,40 +1,60 @@
 //! Command execution helpers for the benchmark runner.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::runner::monitor::{CgroupMonitor, ResourceStats};
 
 /// Path to the shared output log that captures all runner output.
 pub const OUTPUT_FILE: &str = "/tmp/benchmark_output.txt";
 
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_DIAGNOSTIC_AFTER_SECS: u64 = 600;
+const DEFAULT_DIAGNOSTIC_INTERVAL_SECS: u64 = 300;
+const PRE_DEADLINE_DIAGNOSTIC_OFFSET_SECS: u64 = 300;
+
 /// Run a command, log it, stream output to the log file, and return stdout as a string.
 /// Fails if the command exits with a non-zero status.
 pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String> {
     info!(cmd, ?args, ?cwd, "running command");
 
-    let output = Command::new(cmd)
+    let temp_id = temp_log_id();
+    let stdout_path = format!("/tmp/cmd-{temp_id}.stdout");
+    let stderr_path = format!("/tmp/cmd-{temp_id}.stderr");
+
+    let stdout_file = std::fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create stdout log: {stdout_path}"))?;
+    let stderr_file = std::fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create stderr log: {stderr_path}"))?;
+
+    let mut child = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
         .with_context(|| format!("failed to spawn: {cmd} {}", args.join(" ")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let pid = child.id();
+    let status = wait_for_child(cmd, args, cwd, &mut child, pid).await?;
+
+    let stdout = tokio::fs::read_to_string(&stdout_path).await.unwrap_or_default();
+    let stderr = tokio::fs::read_to_string(&stderr_path).await.unwrap_or_default();
 
     // Append to output log
     append_to_log(&stdout).await;
     append_to_log(&stderr).await;
 
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
+    let _ = tokio::fs::remove_file(&stdout_path).await;
+    let _ = tokio::fs::remove_file(&stderr_path).await;
+
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
         anyhow::bail!(
             "{cmd} {} exited with code {code}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             args.join(" ")
@@ -211,6 +231,202 @@ pub async fn log_sccache_stats() {
     if std::env::var("RUSTC_WRAPPER").is_ok() {
         let _ = run_command("sccache", &["--show-stats"], Path::new("/")).await;
     }
+}
+
+async fn wait_for_child(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+) -> Result<std::process::ExitStatus> {
+    let started_at = Instant::now();
+    let diagnostic_after_secs = default_diagnostic_after_secs();
+    let diagnostic_interval_secs =
+        env_u64("RUNNER_COMMAND_DIAGNOSTIC_INTERVAL_SECS", DEFAULT_DIAGNOSTIC_INTERVAL_SECS)
+            .max(1);
+    let timeout_secs = env_optional_u64("RUNNER_COMMAND_TIMEOUT_SECS");
+    let mut next_diagnostic_at = diagnostic_after_secs;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+
+        let elapsed = started_at.elapsed().as_secs();
+        if let Some(pid) = pid {
+            if elapsed >= next_diagnostic_at {
+                emit_process_diagnostics(pid, cmd, args, cwd, elapsed).await;
+                next_diagnostic_at = elapsed.saturating_add(diagnostic_interval_secs);
+            }
+
+            if let Some(timeout_secs) = timeout_secs {
+                if elapsed >= timeout_secs {
+                    warn!(cmd, ?args, pid, timeout_secs, "command timed out");
+                    append_to_log(&format!(
+                        "\n=== command timeout after {elapsed}s ===\ncmd={cmd} args={:?} cwd={}\n",
+                        args,
+                        cwd.display()
+                    ))
+                    .await;
+                    emit_process_diagnostics(pid, cmd, args, cwd, elapsed).await;
+                    dump_process_stack(pid).await;
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    anyhow::bail!(
+                        "{cmd} {} timed out after {timeout_secs}s",
+                        args.join(" ")
+                    );
+                }
+            }
+        }
+
+        tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
+    }
+}
+
+async fn emit_process_diagnostics(
+    pid: u32,
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    elapsed_secs: u64,
+) {
+    let status = read_proc_file(pid, "status").await;
+    let wchan = read_proc_file(pid, "wchan").await;
+    let io = read_proc_file(pid, "io").await;
+    let threads = ps_threads(pid).await;
+
+    let snapshot = format!(
+        "\n=== long-running command diagnostics ===\n\
+         elapsed_secs: {elapsed_secs}\n\
+         pid: {pid}\n\
+         cmd: {cmd}\n\
+         args: {:?}\n\
+         cwd: {}\n\
+         -- /proc/{pid}/status --\n{}\n\
+         -- /proc/{pid}/wchan --\n{}\n\
+         -- /proc/{pid}/io --\n{}\n\
+         -- ps threads --\n{}\n",
+        args,
+        cwd.display(),
+        status.trim_end(),
+        wchan.trim_end(),
+        io.trim_end(),
+        threads.trim_end(),
+    );
+
+    warn!(pid, elapsed_secs, cmd, ?args, "captured long-running command diagnostics");
+    append_to_log(&snapshot).await;
+}
+
+async fn dump_process_stack(pid: u32) {
+    if !command_exists("gdb").await {
+        append_to_log(&format!(
+            "\n=== gdb unavailable; skipping stack dump for pid {pid} ===\n"
+        ))
+        .await;
+        return;
+    }
+
+    let output = Command::new("gdb")
+        .args([
+            "-q",
+            "-batch",
+            "-ex",
+            "set pagination off",
+            "-ex",
+            "thread apply all bt",
+            "-p",
+            &pid.to_string(),
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            append_to_log(&format!(
+                "\n=== gdb thread dump for pid {pid} ===\nstdout:\n{}\nstderr:\n{}\n",
+                stdout.trim_end(),
+                stderr.trim_end(),
+            ))
+            .await;
+        }
+        Err(error) => {
+            append_to_log(&format!(
+                "\n=== failed to run gdb for pid {pid}: {error} ===\n"
+            ))
+            .await;
+        }
+    }
+}
+
+async fn command_exists(cmd: &str) -> bool {
+    Command::new("sh")
+        .args(["-lc", &format!("command -v {cmd}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+async fn ps_threads(pid: u32) -> String {
+    match Command::new("ps")
+        .args([
+            "-L",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "pid,tid,stat,etime,pcpu,pmem,wchan:32,comm",
+        ])
+        .output()
+        .await
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Err(error) => format!("failed to run ps: {error}"),
+    }
+}
+
+async fn read_proc_file(pid: u32, name: &str) -> String {
+    tokio::fs::read_to_string(format!("/proc/{pid}/{name}"))
+        .await
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_optional_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
+fn default_diagnostic_after_secs() -> u64 {
+    if let Some(deadline_secs) = env_optional_u64("RUNNER_JOB_DEADLINE_SECS") {
+        return deadline_secs
+            .saturating_sub(PRE_DEADLINE_DIAGNOSTIC_OFFSET_SECS)
+            .max(60);
+    }
+
+    env_u64(
+        "RUNNER_COMMAND_DIAGNOSTIC_AFTER_SECS",
+        DEFAULT_DIAGNOSTIC_AFTER_SECS,
+    )
+}
+
+fn temp_log_id() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{ts}", std::process::id())
 }
 
 #[cfg(test)]

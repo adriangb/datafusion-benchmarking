@@ -48,6 +48,7 @@ RUN apt-get update && apt-get install -y \
     cmake \
     build-essential \
     curl \
+    gdb \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
