@@ -321,14 +321,6 @@ async fn emit_process_diagnostics(
 }
 
 async fn dump_process_stack(pid: u32) {
-    if !command_exists("gdb").await {
-        append_to_log(&format!(
-            "\n=== gdb unavailable; skipping stack dump for pid {pid} ===\n"
-        ))
-        .await;
-        return;
-    }
-
     let output = Command::new("gdb")
         .args([
             "-q",
@@ -361,17 +353,6 @@ async fn dump_process_stack(pid: u32) {
             .await;
         }
     }
-}
-
-async fn command_exists(cmd: &str) -> bool {
-    Command::new("sh")
-        .args(["-lc", &format!("command -v {cmd}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 async fn ps_threads(pid: u32) -> String {

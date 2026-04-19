@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, EnvVarSource, EphemeralVolumeSource, PersistentVolumeClaimTemplate, PodSpec,
-    PodTemplateSpec, ResourceRequirements, SeccompProfile, SecurityContext, Toleration, Volume,
-    VolumeMount,
+    Capabilities, Container, EnvVar, EnvVarSource, EphemeralVolumeSource,
+    PersistentVolumeClaimTemplate, PodSpec, PodTemplateSpec, ResourceRequirements,
+    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -516,6 +516,10 @@ async fn create_k8s_job(
                             seccomp_profile: Some(SeccompProfile {
                                 type_: "Unconfined".into(),
                                 localhost_profile: None,
+                            }),
+                            capabilities: Some(Capabilities {
+                                add: Some(vec!["SYS_PTRACE".into()]),
+                                ..Default::default()
                             }),
                             ..Default::default()
                         }),
