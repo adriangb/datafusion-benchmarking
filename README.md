@@ -137,6 +137,7 @@ show benchmark queue
 | `tpch10` | TPC-H SF=10 |
 | `tpch_mem` | TPC-H SF=1 in-memory |
 | `tpch_mem10` | TPC-H SF=10 in-memory |
+| `topk_tpch` | Top-K TPC-H |
 | `clickbench_partitioned` | ClickBench partitioned Parquet |
 | `clickbench_extended` | ClickBench extended queries |
 | `clickbench_1` | ClickBench single-file Parquet |

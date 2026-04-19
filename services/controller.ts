@@ -195,6 +195,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                 "adriangb/datafusion": {
                   standard: [
                     "tpch", "tpch10", "tpch_mem", "tpch_mem10",
+                    "topk_tpch",
                     "clickbench_partitioned", "clickbench_extended",
                     "clickbench_1", "clickbench_pushdown",
                     "external_aggr", "tpcds", "smj", "sort_pushdown",
@@ -209,6 +210,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                 "apache/datafusion": {
                   standard: [
                     "tpch", "tpch10", "tpch_mem", "tpch_mem10",
+                    "topk_tpch",
                     "clickbench_partitioned", "clickbench_extended",
                     "clickbench_1", "clickbench_pushdown",
                     "external_aggr", "tpcds", "smj", "sort_pushdown",

@@ -346,6 +346,7 @@ mod tests {
                 "tpch10".into(),
                 "tpch_mem".into(),
                 "tpch_mem10".into(),
+                "topk_tpch".into(),
                 "clickbench_partitioned".into(),
                 "clickbench_extended".into(),
                 "clickbench_1".into(),
