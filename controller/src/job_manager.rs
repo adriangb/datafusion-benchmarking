@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, EnvVar, EnvVarSource, EphemeralVolumeSource,
-    PersistentVolumeClaimTemplate, PodSpec, PodTemplateSpec, ResourceRequirements,
-    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
+    PersistentVolumeClaimTemplate, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
+    SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -330,7 +330,14 @@ async fn create_k8s_job(
         env_var("JOB_ID", job.id.to_string()),
         env_var("RUNNER_TOKEN", runner_token),
         env_var("CONTROLLER_URL", controller_url(&config.k8s_namespace)),
-        env_var("RUNNER_JOB_DEADLINE_SECS", config.active_deadline_secs.to_string()),
+        env_var(
+            "RUNNER_JOB_DEADLINE_SECS",
+            config.active_deadline_secs.to_string(),
+        ),
+        // Keep DWARF symbols in release-built benchmark binaries so live gdb
+        // dumps from hung jobs resolve to useful frames without changing
+        // optimization level.
+        env_var("CARGO_PROFILE_RELEASE_DEBUG", "1"),
     ];
 
     // The controller resolves the PR's source branch and hands it to the
