@@ -1,8 +1,8 @@
 //! Command execution helpers for the benchmark runner.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::process::Stdio;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
@@ -43,8 +43,12 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
     let pid = child.id();
     let status = wait_for_child(cmd, args, cwd, &mut child, pid).await?;
 
-    let stdout = tokio::fs::read_to_string(&stdout_path).await.unwrap_or_default();
-    let stderr = tokio::fs::read_to_string(&stderr_path).await.unwrap_or_default();
+    let stdout = tokio::fs::read_to_string(&stdout_path)
+        .await
+        .unwrap_or_default();
+    let stderr = tokio::fs::read_to_string(&stderr_path)
+        .await
+        .unwrap_or_default();
 
     // Append to output log
     append_to_log(&stdout).await;
@@ -242,9 +246,11 @@ async fn wait_for_child(
 ) -> Result<std::process::ExitStatus> {
     let started_at = Instant::now();
     let diagnostic_after_secs = default_diagnostic_after_secs();
-    let diagnostic_interval_secs =
-        env_u64("RUNNER_COMMAND_DIAGNOSTIC_INTERVAL_SECS", DEFAULT_DIAGNOSTIC_INTERVAL_SECS)
-            .max(1);
+    let diagnostic_interval_secs = env_u64(
+        "RUNNER_COMMAND_DIAGNOSTIC_INTERVAL_SECS",
+        DEFAULT_DIAGNOSTIC_INTERVAL_SECS,
+    )
+    .max(1);
     let timeout_secs = env_optional_u64("RUNNER_COMMAND_TIMEOUT_SECS");
     let mut next_diagnostic_at = diagnostic_after_secs;
 
@@ -273,10 +279,7 @@ async fn wait_for_child(
                     dump_process_stack(pid).await;
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    anyhow::bail!(
-                        "{cmd} {} timed out after {timeout_secs}s",
-                        args.join(" ")
-                    );
+                    anyhow::bail!("{cmd} {} timed out after {timeout_secs}s", args.join(" "));
                 }
             }
         }
@@ -316,7 +319,13 @@ async fn emit_process_diagnostics(
         threads.trim_end(),
     );
 
-    warn!(pid, elapsed_secs, cmd, ?args, "captured long-running command diagnostics");
+    warn!(
+        pid,
+        elapsed_secs,
+        cmd,
+        ?args,
+        "captured long-running command diagnostics"
+    );
     append_to_log(&snapshot).await;
 }
 

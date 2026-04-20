@@ -249,8 +249,8 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
             },
           ],
           resources: {
-            requests: { cpu: "250m", memory: "256Mi" },
-            limits: { cpu: "500m", memory: "512Mi" },
+            requests: { cpu: "1", memory: "512Mi" },
+            limits: { cpu: "1", memory: "512Mi" },
           },
           volumeMounts: [{
             name: "controller-db",

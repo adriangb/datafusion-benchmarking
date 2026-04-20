@@ -3,9 +3,11 @@
 //! the controller authenticates the caller with a per-job random token
 //! injected into the pod at creation time and posts on its behalf.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use backon::{ExponentialBuilder, Retryable};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde_json::json;
 
 #[derive(Clone)]
@@ -35,6 +37,9 @@ impl ControllerClient {
         let url = format!("{}/jobs/{}/comment", self.base_url, self.job_id);
         let payload = json!({ "body": body });
 
+        // Retry everything: the controller is an internal service and a brief
+        // outage (e.g. during a redeploy or Autopilot preemption) shouldn't
+        // fail the whole benchmark run.
         (|| {
             let url = url.clone();
             let payload = payload.clone();
@@ -55,23 +60,12 @@ impl ControllerClient {
                 anyhow::bail!("controller comment endpoint returned {status}: {body}");
             }
         })
-        .retry(ExponentialBuilder::default().with_max_times(3))
+        .retry(
+            ExponentialBuilder::default()
+                .with_max_times(8)
+                .with_max_delay(Duration::from_secs(15)),
+        )
         .sleep(tokio::time::sleep)
-        .when(is_retryable)
         .await
     }
-}
-
-fn is_retryable(err: &anyhow::Error) -> bool {
-    if let Some(re) = err.downcast_ref::<reqwest::Error>() {
-        if re.is_connect() || re.is_timeout() || re.is_request() {
-            return true;
-        }
-        if let Some(status) = re.status() {
-            return status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS;
-        }
-        return true;
-    }
-    let msg = err.to_string();
-    msg.contains("returned 5") || msg.contains("returned 429")
 }
