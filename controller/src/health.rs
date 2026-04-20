@@ -146,9 +146,12 @@ async fn handle_job_comment(
         Some(tok) if constant_time_eq(tok.as_bytes(), supplied.as_bytes()) => {}
         _ => return Ok(UNAUTHORIZED.to_vec()),
     }
-    // Only jobs that the controller currently believes are running may post
-    // comments — prevents replay after completion/failure.
-    if status != "running" {
+    // The runner may try to post its initial "running" comment before the
+    // reconciler has updated the DB row from `pending` to `running`.
+    // Accepting both non-terminal states avoids that startup race while still
+    // preventing replay after completion/failure.
+    if !status_allows_runner_comment(&status) {
+        tracing::warn!(job_id, status, "rejecting runner comment in terminal state");
         return Ok(CONFLICT.to_vec());
     }
 
@@ -189,6 +192,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+fn status_allows_runner_comment(status: &str) -> bool {
+    matches!(status, "pending" | "running")
 }
 
 // ── Minimal HTTP/1.1 request parsing ────────────────────────────────
@@ -338,5 +345,17 @@ mod tests {
         let buf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody";
         let pos = find_header_end(buf).unwrap();
         assert_eq!(&buf[pos..pos + 4], b"\r\n\r\n");
+    }
+
+    #[test]
+    fn runner_comments_allowed_for_non_terminal_states() {
+        assert!(status_allows_runner_comment("pending"));
+        assert!(status_allows_runner_comment("running"));
+    }
+
+    #[test]
+    fn runner_comments_rejected_for_terminal_states() {
+        assert!(!status_allows_runner_comment("completed"));
+        assert!(!status_allows_runner_comment("failed"));
     }
 }
