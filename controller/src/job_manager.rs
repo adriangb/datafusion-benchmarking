@@ -165,11 +165,13 @@ async fn reconcile_active(
                 // backoffLimit > 0, K8s increments that counter on each pod
                 // failure while retries are still in progress. The "Failed"
                 // condition is only added once all retries are exhausted.
-                let failed_cond = status.and_then(|s| s.conditions.as_ref()).and_then(|conds| {
-                    conds
-                        .iter()
-                        .find(|c| c.type_ == "Failed" && c.status == "True")
-                });
+                let failed_cond = status
+                    .and_then(|s| s.conditions.as_ref())
+                    .and_then(|conds| {
+                        conds
+                            .iter()
+                            .find(|c| c.type_ == "Failed" && c.status == "True")
+                    });
 
                 if succeeded > 0 {
                     info!(comment_id = job.comment_id, "job completed successfully");
