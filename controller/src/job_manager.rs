@@ -59,7 +59,7 @@ pub async fn reconcile_loop(
         if let Err(e) = reconcile_pending(&config, &pool, &gh, &kube_client).await {
             warn!(error = %e, "reconcile pending error");
         }
-        if let Err(e) = reconcile_active(&config, &pool, &kube_client).await {
+        if let Err(e) = reconcile_active(&config, &pool, &gh, &kube_client).await {
             warn!(error = %e, "reconcile active error");
         }
         tokio::select! {
@@ -140,7 +140,12 @@ async fn reconcile_pending(
 
 /// Check K8s Job status for all running benchmark rows and transition to completed/failed.
 #[tracing::instrument(skip_all)]
-async fn reconcile_active(config: &Config, pool: &SqlitePool, kube: &KubeClient) -> Result<()> {
+async fn reconcile_active(
+    config: &Config,
+    pool: &SqlitePool,
+    gh: &GitHubClient,
+    kube: &KubeClient,
+) -> Result<()> {
     let active = db::get_active_jobs(pool).await?;
     let jobs_api: Api<Job> = Api::namespaced(kube.clone(), &config.k8s_namespace);
 
@@ -160,32 +165,38 @@ async fn reconcile_active(config: &Config, pool: &SqlitePool, kube: &KubeClient)
                 // backoffLimit > 0, K8s increments that counter on each pod
                 // failure while retries are still in progress. The "Failed"
                 // condition is only added once all retries are exhausted.
-                let is_terminal_failure = status
-                    .and_then(|s| s.conditions.as_ref())
-                    .map(|conds| {
-                        conds
-                            .iter()
-                            .any(|c| c.type_ == "Failed" && c.status == "True")
-                    })
-                    .unwrap_or(false);
+                let failed_cond = status.and_then(|s| s.conditions.as_ref()).and_then(|conds| {
+                    conds
+                        .iter()
+                        .find(|c| c.type_ == "Failed" && c.status == "True")
+                });
 
                 if succeeded > 0 {
                     info!(comment_id = job.comment_id, "job completed successfully");
                     db::update_job_status(pool, job.id, JobStatus::Completed, None, None).await?;
-                } else if is_terminal_failure {
+                } else if let Some(cond) = failed_cond {
                     let failed_count = status.and_then(|s| s.failed).unwrap_or(0);
+                    let reason = cond.reason.as_deref().unwrap_or("");
+                    let message = cond.message.as_deref().unwrap_or("");
                     info!(
                         comment_id = job.comment_id,
-                        failed_count, "job failed after all retries"
+                        failed_count, reason, message, "job failed terminally"
                     );
-                    db::update_job_status(
-                        pool,
-                        job.id,
-                        JobStatus::Failed,
-                        None,
-                        Some("K8s job failed after all retries"),
-                    )
-                    .await?;
+                    let err_msg = if reason.is_empty() {
+                        "K8s job failed".to_string()
+                    } else {
+                        format!("K8s job failed: {reason}")
+                    };
+                    db::update_job_status(pool, job.id, JobStatus::Failed, None, Some(&err_msg))
+                        .await?;
+
+                    // When a Job hits `activeDeadlineSeconds`, K8s SIGKILLs the
+                    // runner pod before the runner's `post_error_comment` can
+                    // fire. The controller posts the notification here so the
+                    // PR doesn't go silent.
+                    if reason == "DeadlineExceeded" {
+                        post_deadline_exceeded_comment(config, gh, &job, message).await;
+                    }
                 }
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -209,6 +220,44 @@ async fn reconcile_active(config: &Config, pool: &SqlitePool, kube: &KubeClient)
     }
 
     Ok(())
+}
+
+/// Post a PR comment when a benchmark Job hits `activeDeadlineSeconds`.
+///
+/// The runner's own `post_error_comment` can't fire in this case because the
+/// deadline SIGKILLs the pod. Failures to post are logged but not propagated —
+/// the DB is already marked failed, and repeatedly retrying would risk double
+/// comments.
+async fn post_deadline_exceeded_comment(
+    config: &Config,
+    gh: &GitHubClient,
+    job: &BenchmarkJob,
+    k8s_message: &str,
+) {
+    let benchmarks = serde_json::from_str::<Vec<String>>(&job.benchmarks)
+        .map(|v| v.join(", "))
+        .unwrap_or_else(|_| job.benchmarks.clone());
+    let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
+    let footer = github::issues_footer(config.runner_repo_url.as_deref());
+    let k8s_detail = if k8s_message.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n<details><summary>Kubernetes message</summary>\n\n```\n{k8s_message}\n```\n\n</details>"
+        )
+    };
+    let body = format!(
+        "Benchmark for [this request]({comment_url}) hit the {deadline}s job deadline before finishing.\n\n\
+         Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
+        deadline = config.active_deadline_secs,
+    );
+    if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &body).await {
+        warn!(
+            comment_id = job.comment_id,
+            error = %e,
+            "failed to post deadline-exceeded comment"
+        );
+    }
 }
 
 /// Shorthand for constructing a plain-value [`EnvVar`].

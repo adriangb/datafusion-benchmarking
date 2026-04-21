@@ -129,7 +129,7 @@ impl Config {
             default_memory: env_or("DEFAULT_MEMORY", "65Gi"),
             ephemeral_storage: env_or("EPHEMERAL_STORAGE", "128Gi"),
             default_machine_family: env_or("DEFAULT_MACHINE_FAMILY", "c4a"),
-            active_deadline_secs: env_or("ACTIVE_DEADLINE_SECS", "3600")
+            active_deadline_secs: env_or("ACTIVE_DEADLINE_SECS", "7200")
                 .parse()
                 .context("ACTIVE_DEADLINE_SECS")?,
             ttl_after_finished_secs: env_or("TTL_AFTER_FINISHED_SECS", "3600")
