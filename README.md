@@ -150,6 +150,7 @@ show benchmark queue
 | `sort_pushdown_inexact` | Sort pushdown inexact |
 | `sort_pushdown_inexact_unsorted` | Sort pushdown inexact unsorted |
 | `sort_pushdown_inexact_overlap` | Sort pushdown inexact overlap |
+| `adversarial_filter` | Adaptive filter conjunct-reordering stress test |
 
 ### DataFusion (criterion)
 
