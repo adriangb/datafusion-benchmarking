@@ -385,10 +385,21 @@ async fn create_k8s_job(
             "RUNNER_JOB_DEADLINE_SECS",
             config.active_deadline_secs.to_string(),
         ),
-        // Keep DWARF symbols in release-built benchmark binaries so live gdb
-        // dumps from hung jobs resolve to useful frames without changing
-        // optimization level.
-        env_var("CARGO_PROFILE_RELEASE_DEBUG", "1"),
+        // NOTE: we deliberately do NOT set CARGO_PROFILE_RELEASE_DEBUG here.
+        // Building with debuginfo (`debug=1`) makes rustc and the linker use
+        // dramatically more memory: a single benchmark compile was observed
+        // driving one rustc to ~16 GB and the pod cgroup to its 65 GiB limit
+        // (OOM-kill) — before any benchmark query ran. Default builds stay
+        // fast and lean. A specific run can re-enable DWARF symbols for live
+        // gdb dumps from hung jobs by adding a shared `env:` block to the
+        // trigger comment (shared env is inherited by the build processes,
+        // unlike per-side `baseline:`/`changed:` env which only reaches the
+        // benchmark run). To keep memory in check, pair it with a job cap:
+        //
+        //   run benchmark <name>
+        //   env:
+        //     CARGO_PROFILE_RELEASE_DEBUG: "1"
+        //     CARGO_BUILD_JOBS: "1"
     ];
 
     // The controller resolves the PR's source branch and hands it to the
