@@ -311,10 +311,15 @@ pub fn supported_benchmarks_message(repo_entry: &RepoEntry, requested: &[String]
          Per-side configuration (`run benchmark tpch` followed by):\n\
          ```yaml\n\
          env:\n\
-           SHARED_SETTING: enabled\n\
+           # shared env is inherited by BOTH the build and the run, so build\n\
+           # flags go here. Builds default to no debuginfo for speed; opt back\n\
+           # in for hung-job gdb dumps and cap jobs to stay within memory:\n\
+           CARGO_PROFILE_RELEASE_DEBUG: \"1\"\n\
+           CARGO_BUILD_JOBS: \"1\"\n\
          baseline:\n\
            ref: v45.0.0\n\
            env:\n\
+             # per-side env only reaches the benchmark run, not the build\n\
              DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G\n\
          changed:\n\
            ref: v46.0.0\n\
