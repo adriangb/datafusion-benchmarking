@@ -18,11 +18,18 @@ const DEFAULT_DIAGNOSTIC_AFTER_SECS: u64 = 600;
 const DEFAULT_DIAGNOSTIC_INTERVAL_SECS: u64 = 300;
 const PRE_DEADLINE_DIAGNOSTIC_OFFSET_SECS: u64 = 300;
 
-/// Run a command, log it, stream output to the log file, and return stdout as a string.
-/// Fails if the command exits with a non-zero status.
-pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String> {
-    info!(cmd, ?args, ?cwd, "running command");
+/// A spawned command with its captured-output paths, used to split spawning
+/// from waiting so callers (e.g. the resource monitor) can observe the PID
+/// while the command runs.
+struct SpawnedCommand {
+    child: tokio::process::Child,
+    pid: Option<u32>,
+    stdout_path: String,
+    stderr_path: String,
+}
 
+/// Spawn a command with stdout/stderr redirected to temp log files.
+fn spawn_logged(cmd: &str, args: &[&str], cwd: &Path) -> Result<SpawnedCommand> {
     let temp_id = temp_log_id();
     let stdout_path = format!("/tmp/cmd-{temp_id}.stdout");
     let stderr_path = format!("/tmp/cmd-{temp_id}.stderr");
@@ -32,7 +39,7 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
     let stderr_file = std::fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create stderr log: {stderr_path}"))?;
 
-    let mut child = Command::new(cmd)
+    let child = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
         .stdout(Stdio::from(stdout_file))
@@ -41,12 +48,28 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
         .with_context(|| format!("failed to spawn: {cmd} {}", args.join(" ")))?;
 
     let pid = child.id();
-    let status = wait_for_child(cmd, args, cwd, &mut child, pid).await?;
+    Ok(SpawnedCommand {
+        child,
+        pid,
+        stdout_path,
+        stderr_path,
+    })
+}
 
-    let stdout = tokio::fs::read_to_string(&stdout_path)
+/// Wait for a spawned command, collect its output into the shared log, and
+/// return stdout. Fails if the command exits with a non-zero status.
+async fn finish_logged(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    mut spawned: SpawnedCommand,
+) -> Result<String> {
+    let status = wait_for_child(cmd, args, cwd, &mut spawned.child, spawned.pid).await?;
+
+    let stdout = tokio::fs::read_to_string(&spawned.stdout_path)
         .await
         .unwrap_or_default();
-    let stderr = tokio::fs::read_to_string(&stderr_path)
+    let stderr = tokio::fs::read_to_string(&spawned.stderr_path)
         .await
         .unwrap_or_default();
 
@@ -54,8 +77,8 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
     append_to_log(&stdout).await;
     append_to_log(&stderr).await;
 
-    let _ = tokio::fs::remove_file(&stdout_path).await;
-    let _ = tokio::fs::remove_file(&stderr_path).await;
+    let _ = tokio::fs::remove_file(&spawned.stdout_path).await;
+    let _ = tokio::fs::remove_file(&spawned.stderr_path).await;
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
@@ -68,7 +91,20 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
     Ok(stdout)
 }
 
-/// Run a command with cgroup resource monitoring. Returns both stdout and resource stats.
+/// Run a command, log it, stream output to the log file, and return stdout as a string.
+/// Fails if the command exits with a non-zero status.
+pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String> {
+    info!(cmd, ?args, ?cwd, "running command");
+    let spawned = spawn_logged(cmd, args, cwd)?;
+    finish_logged(cmd, args, cwd, spawned).await
+}
+
+/// Run a command with resource monitoring. Returns both stdout and resource stats.
+///
+/// The monitor is scoped to the spawned command's process subtree (see
+/// [`CgroupMonitor`]), so the reported memory reflects the benchmark itself
+/// rather than the whole pod (which would also count any compilation,
+/// page cache, and leftover build artifacts).
 ///
 /// If `spill_dir` is provided, the monitor will poll the directory size every
 /// second to track peak spill usage.
@@ -78,10 +114,12 @@ pub async fn run_command_monitored(
     cwd: &Path,
     spill_dir: Option<PathBuf>,
 ) -> Result<(String, ResourceStats)> {
-    let monitor = CgroupMonitor::start(spill_dir);
-    let output = run_command(cmd, args, cwd).await?;
+    info!(cmd, ?args, ?cwd, "running command (monitored)");
+    let spawned = spawn_logged(cmd, args, cwd)?;
+    let monitor = CgroupMonitor::start(spawned.pid, spill_dir);
+    let output = finish_logged(cmd, args, cwd, spawned).await;
     let stats = monitor.finish().await;
-    Ok((output, stats))
+    Ok((output?, stats))
 }
 
 /// Spawn a command in the background, returning a JoinHandle that resolves to the Result.
