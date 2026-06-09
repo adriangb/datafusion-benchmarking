@@ -232,7 +232,7 @@ fn bench_command_args(bench_name: &str) -> Vec<String> {
 }
 
 /// Copy criterion baselines from base to branch target directory.
-async fn copy_criterion_baselines(base_dir: &Path, branch_dir: &Path) {
+pub(crate) async fn copy_criterion_baselines(base_dir: &Path, branch_dir: &Path) {
     let src = base_dir.join("target/criterion");
     let dst = branch_dir.join("target/criterion");
     if src.exists() {
