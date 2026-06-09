@@ -1,17 +1,20 @@
 //! Resource monitoring for benchmark execution.
 //!
-//! Memory is sampled from the benchmark command's **process subtree** by
-//! walking `/proc/<pid>/status` (summing `VmRSS`) and excluding compiler /
-//! build-tool processes (`rustc`, `cargo`, `cc`, `ld`, `sccache`, …). That is
-//! what we report as the benchmark's memory. Reading the pod-wide cgroup
-//! (`/sys/fs/cgroup/memory.current`) instead would also count page cache,
-//! leftover build artifacts, and — for benchmarks whose `bench.sh run` step
-//! compiles (e.g. `cargo bench`) — the compiler itself, which can dwarf the
-//! actual query memory by tens of GB.
+//! When the benchmark command's root pid is known and `/proc` is readable,
+//! both memory and CPU are sampled from its **process subtree** by walking
+//! `/proc/<pid>/status` (summing `VmRSS`) and `/proc/<pid>/stat` (accumulating
+//! `utime`/`stime`), excluding compiler / build-tool processes (`rustc`,
+//! `cargo`, `cc`, `ld`, `sccache`, …). That is what we report. Reading the
+//! pod-wide cgroup (`/sys/fs/cgroup/memory.current`, `cpu.stat`) instead would
+//! also count page cache, leftover build artifacts, and — for benchmarks whose
+//! `bench.sh run` step compiles (e.g. `cargo bench`) — the compiler itself,
+//! which can dwarf the actual query memory and CPU by tens of GB / thousands of
+//! CPU-seconds.
 //!
-//! CPU stats still come from cgroup v2 `cpu.stat`. When the per-process root
-//! pid is unknown the sampler falls back to the cgroup memory figure. When
-//! neither `/proc` nor the cgroup files are available (e.g. local macOS
+//! When the root pid is unknown, or `/proc` can't be read (e.g. a restricted
+//! container), the sampler falls back to the pod-wide cgroup figures: memory
+//! from `memory.current` and CPU from the `cpu.stat` delta over the window.
+//! When neither `/proc` nor the cgroup files are available (e.g. local macOS
 //! development), reads return `None` and stats default to zero.
 
 use std::fmt;
@@ -113,10 +116,14 @@ pub struct CgroupMonitor {
     peak_spill: Arc<AtomicU64>,
     sample_count: Arc<AtomicU64>,
     // Per-process CPU consumed by the benchmark subtree (excluding build
-    // tools), accumulated in the poll loop. Only meaningful when `root_pid` is
+    // tools), accumulated in the poll loop. Only meaningful when `proc_ok` is
     // set; otherwise CPU is taken from the cgroup delta in `finish`.
     cpu_user_usec: Arc<AtomicU64>,
     cpu_sys_usec: Arc<AtomicU64>,
+    // Set once any `/proc` subtree sample succeeds. When this stays false (root
+    // pid unknown, or `/proc` unreadable) memory and CPU both come from the
+    // pod-wide cgroup instead.
+    proc_ok: Arc<AtomicBool>,
     poll_handle: JoinHandle<()>,
 }
 
@@ -140,6 +147,7 @@ impl CgroupMonitor {
         let sample_count = Arc::new(AtomicU64::new(1));
         let cpu_user_usec = Arc::new(AtomicU64::new(0));
         let cpu_sys_usec = Arc::new(AtomicU64::new(0));
+        let proc_ok = Arc::new(AtomicBool::new(false));
 
         let poll_handle = {
             let stop = stop_flag.clone();
@@ -149,6 +157,7 @@ impl CgroupMonitor {
             let count = sample_count.clone();
             let cpu_user = cpu_user_usec.clone();
             let cpu_sys = cpu_sys_usec.clone();
+            let proc_ok = proc_ok.clone();
 
             tokio::spawn(async move {
                 // Per-pid first/last cumulative CPU ticks, so each benchmark
@@ -159,12 +168,13 @@ impl CgroupMonitor {
                 let mut cpu_last: std::collections::HashMap<u32, (u64, u64)> =
                     std::collections::HashMap::new();
 
-                while !stop.load(Ordering::Relaxed) {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
+                // One memory+CPU sample. Prefers the `/proc` subtree; falls back
+                // to the pod-wide cgroup figure when `/proc` can't be read
+                // (root pid unknown, or no `/proc`, e.g. a restricted container).
+                let sample = |cpu_first: &mut std::collections::HashMap<u32, (u64, u64)>,
+                                  cpu_last: &mut std::collections::HashMap<u32, (u64, u64)>| {
                     if let Some((rss, cpus)) = proc_tree_sample(root_pid) {
+                        proc_ok.store(true, Ordering::Relaxed);
                         peak.fetch_max(rss, Ordering::Relaxed);
                         sum.fetch_add(rss, Ordering::Relaxed);
                         count.fetch_add(1, Ordering::Relaxed);
@@ -176,7 +186,7 @@ impl CgroupMonitor {
                         // Recompute accumulated subtree CPU each poll.
                         let mut tu = 0u64;
                         let mut ts = 0u64;
-                        for (pid, &(fu, fs)) in &cpu_first {
+                        for (pid, &(fu, fs)) in &*cpu_first {
                             if let Some(&(lu, ls)) = cpu_last.get(pid) {
                                 tu += lu.saturating_sub(fu);
                                 ts += ls.saturating_sub(fs);
@@ -184,19 +194,32 @@ impl CgroupMonitor {
                         }
                         cpu_user.store(ticks_to_usec(tu), Ordering::Relaxed);
                         cpu_sys.store(ticks_to_usec(ts), Ordering::Relaxed);
-                    } else if root_pid.is_none() {
-                        // Fallback path: keep memory sampling via cgroup.
-                        if let Some(current) = read_memory_current() {
-                            peak.fetch_max(current, Ordering::Relaxed);
-                            sum.fetch_add(current, Ordering::Relaxed);
-                            count.fetch_add(1, Ordering::Relaxed);
-                        }
+                    } else if let Some(current) = read_memory_current() {
+                        // Fallback: pod-wide cgroup memory. CPU comes from the
+                        // cgroup delta in `finish` when `proc_ok` is never set.
+                        peak.fetch_max(current, Ordering::Relaxed);
+                        sum.fetch_add(current, Ordering::Relaxed);
+                        count.fetch_add(1, Ordering::Relaxed);
                     }
+                };
+
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    sample(&mut cpu_first, &mut cpu_last);
                     if let Some(ref dir) = spill_dir {
                         let size = dir_size(dir);
                         spill_peak.fetch_max(size, Ordering::Relaxed);
                     }
                 }
+
+                // Final sample once stop is signalled, so memory and CPU are
+                // captured right up to the end of the run rather than as of the
+                // last full poll interval (which could undercount by up to
+                // POLL_INTERVAL).
+                sample(&mut cpu_first, &mut cpu_last);
             })
         };
 
@@ -212,6 +235,7 @@ impl CgroupMonitor {
             sample_count,
             cpu_user_usec,
             cpu_sys_usec,
+            proc_ok,
             poll_handle,
         }
     }
@@ -223,16 +247,22 @@ impl CgroupMonitor {
         self.stop_flag.store(true, Ordering::Relaxed);
         let _ = self.poll_handle.await;
 
-        let end_memory = sample_memory(self.root_pid).unwrap_or(0);
-
+        // The poll loop's final sample already updated peak/sum/count up to the
+        // end of the run, so don't take (and double-count) another into them.
+        let proc_ok = self.proc_ok.load(Ordering::Relaxed);
+        let end_memory = if proc_ok {
+            sample_memory(self.root_pid).unwrap_or(0)
+        } else {
+            read_memory_current().unwrap_or(0)
+        };
         let peak = self.peak_memory.load(Ordering::Relaxed).max(end_memory);
-        let total_sum = self.memory_sum.load(Ordering::Relaxed) + end_memory;
-        let total_count = self.sample_count.load(Ordering::Relaxed) + 1;
+        let total_sum = self.memory_sum.load(Ordering::Relaxed);
+        let total_count = self.sample_count.load(Ordering::Relaxed);
         let avg = total_sum.checked_div(total_count).unwrap_or(0);
 
-        // CPU: per-process subtree accumulation when we have a root pid (so the
-        // compile is excluded), otherwise the pod-wide cgroup delta.
-        let (cpu_user, cpu_sys) = if self.root_pid.is_some() {
+        // CPU: per-process subtree accumulation when `/proc` sampling worked (so
+        // the compile is excluded), otherwise the pod-wide cgroup delta.
+        let (cpu_user, cpu_sys) = if proc_ok {
             (
                 self.cpu_user_usec.load(Ordering::Relaxed),
                 self.cpu_sys_usec.load(Ordering::Relaxed),
@@ -263,10 +293,26 @@ impl CgroupMonitor {
     }
 }
 
-/// Clock ticks (USER_HZ) to microseconds. Linux USER_HZ is 100 on all common
-/// configurations, so a tick is 10 ms = 10_000 µs.
+/// Clock ticks per second (`USER_HZ`), read once from `sysconf(_SC_CLK_TCK)`.
+/// This is 100 on most Linux configurations but is not guaranteed, so we query
+/// it rather than hard-coding it. Falls back to 100 if the query fails.
+fn clk_tck() -> u64 {
+    use std::sync::OnceLock;
+    static TCK: OnceLock<u64> = OnceLock::new();
+    *TCK.get_or_init(|| {
+        let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if v > 0 {
+            v as u64
+        } else {
+            100
+        }
+    })
+}
+
+/// Convert cumulative clock ticks (`USER_HZ`) from `/proc/<pid>/stat` to
+/// microseconds, using the actual `_SC_CLK_TCK` value.
 fn ticks_to_usec(ticks: u64) -> u64 {
-    ticks.saturating_mul(10_000)
+    ticks.saturating_mul(1_000_000) / clk_tck()
 }
 
 // --- per-process sampling ---
@@ -295,10 +341,12 @@ type ProcCpu = (u32, u64, u64);
 type SubtreeSample = (u64, Vec<ProcCpu>);
 
 /// Sample current memory: the benchmark process subtree RSS when `root_pid` is
-/// known, otherwise the pod-wide cgroup figure.
+/// known and `/proc` is readable, otherwise the pod-wide cgroup figure.
 fn sample_memory(root_pid: Option<u32>) -> Option<u64> {
     match root_pid {
-        Some(pid) => proc_tree_sample(Some(pid)).map(|(rss, _)| rss),
+        Some(pid) => proc_tree_sample(Some(pid))
+            .map(|(rss, _)| rss)
+            .or_else(read_memory_current),
         None => read_memory_current(),
     }
 }
@@ -576,7 +624,10 @@ throttled_usec 0
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stats = monitor.finish().await;
         assert!(stats.wall_time >= Duration::from_millis(50));
-        assert!(stats.sample_count >= 2);
+        // The start baseline always counts as one sample; additional samples
+        // require a readable data source (cgroup or `/proc`), which is absent on
+        // e.g. local macOS development.
+        assert!(stats.sample_count >= 1);
     }
 
     // Multi-threaded runtime so the background poll task can sample while this
@@ -625,9 +676,11 @@ throttled_usec 0
 
     #[test]
     fn test_ticks_to_usec() {
+        let tck = clk_tck();
+        assert!(tck > 0);
         assert_eq!(ticks_to_usec(0), 0);
-        assert_eq!(ticks_to_usec(1), 10_000); // 1 tick = 10ms = 10_000us
-        assert_eq!(ticks_to_usec(100), 1_000_000); // 100 ticks = 1s
+        // `clk_tck` ticks = exactly one second, whatever USER_HZ happens to be.
+        assert_eq!(ticks_to_usec(tck), 1_000_000);
     }
 
     #[test]
