@@ -18,8 +18,7 @@ use crate::runner::poster::CommentPoster;
 /// Benchmark runner variant, parsed from `BENCH_TYPE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchType {
-    Standard,
-    Criterion,
+    Datafusion,
     ArrowCriterion,
     MainTracking,
 }
@@ -27,8 +26,10 @@ pub enum BenchType {
 impl BenchType {
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "standard" => Ok(Self::Standard),
-            "criterion" => Ok(Self::Criterion),
+            // `standard`/`criterion` are legacy job-type strings that may still
+            // be present on in-flight DB rows; both map to the unified
+            // datafusion runner.
+            "datafusion" | "standard" | "criterion" => Ok(Self::Datafusion),
             "arrow_criterion" => Ok(Self::ArrowCriterion),
             "main_tracking" => Ok(Self::MainTracking),
             other => anyhow::bail!("unknown BENCH_TYPE: {other}"),
@@ -212,18 +213,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bench_type_standard() {
+    fn bench_type_datafusion() {
         assert_eq!(
-            BenchType::from_str("standard").unwrap(),
-            BenchType::Standard
+            BenchType::from_str("datafusion").unwrap(),
+            BenchType::Datafusion
         );
     }
 
     #[test]
-    fn bench_type_criterion() {
+    fn bench_type_legacy_strings_map_to_datafusion() {
+        // In-flight DB rows may still carry the old job-type strings.
+        assert_eq!(
+            BenchType::from_str("standard").unwrap(),
+            BenchType::Datafusion
+        );
         assert_eq!(
             BenchType::from_str("criterion").unwrap(),
-            BenchType::Criterion
+            BenchType::Datafusion
         );
     }
 

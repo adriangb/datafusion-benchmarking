@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::benchmarks::{
     allowed_users_markdown, detect_benchmark, is_benchmark_trigger, is_queue_request,
-    is_singular_no_names, supported_benchmarks_message, DetectResult,
+    is_singular_no_names, usage_message, DetectResult,
 };
 use crate::config::{BenchmarkConfig, Config, RepoEntry, MAX_QUEUED_PER_USER};
 use crate::db;
@@ -208,7 +208,7 @@ async fn process_comment(
     }
 
     // Try to detect benchmark trigger
-    let request = match detect_benchmark(repo_entry, body) {
+    let request = match detect_benchmark(body) {
         DetectResult::Parsed(req) => req,
         DetectResult::ConfigError(err) => {
             // YAML config was present but invalid — post a helpful error
@@ -216,7 +216,7 @@ async fn process_comment(
                 let msg = format!(
                     "Hi @{login}, your benchmark configuration could not be parsed ({comment_url}).\n\n\
                      **Error:** `{err}`\n\n{}{footer}",
-                    supported_benchmarks_message(repo_entry, &[])
+                    usage_message()
                 );
                 gh.post_comment(repo, pr_number, &msg).await?;
             }
@@ -224,7 +224,9 @@ async fn process_comment(
             return Ok(());
         }
         DetectResult::None => {
-            // Check if it looks like a failed trigger attempt
+            // With no allowlist, named/default triggers always parse, so the
+            // only `None` cases that look like a trigger are `run benchmark`
+            // (singular) with no names.
             if is_benchmark_trigger(body) {
                 if !bench_cfg.allowed_users.contains(login) {
                     let msg = not_allowed_message(
@@ -235,16 +237,6 @@ async fn process_comment(
                     );
                     gh.post_comment(repo, pr_number, &msg).await?;
                 } else {
-                    // Singular "run benchmark" with no names, or invalid names
-                    let requested: Vec<String> = body
-                        .trim()
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .skip(2)
-                        .map(|s| s.to_string())
-                        .collect();
                     let prefix = if is_singular_no_names(body) {
                         format!(
                             "Hi @{login}, `run benchmark` requires benchmark names ({comment_url}).\n\n"
@@ -252,10 +244,7 @@ async fn process_comment(
                     } else {
                         format!("Hi @{login}, thanks for the request ({comment_url}).\n\n")
                     };
-                    let msg = format!(
-                        "{prefix}{}{footer}",
-                        supported_benchmarks_message(repo_entry, &requested)
-                    );
+                    let msg = format!("{prefix}{}{footer}", usage_message());
                     gh.post_comment(repo, pr_number, &msg).await?;
                 }
             }
@@ -307,9 +296,12 @@ async fn process_comment(
     let baseline_env_json = serde_json::to_string(&request.baseline_env_vars)?;
     let changed_env_json = serde_json::to_string(&request.changed_env_vars)?;
 
-    // Determine job type(s) and insert jobs
+    // The job type is per-repo (the datafusion runner resolves each name
+    // itself), so there is no per-benchmark classification.
+    let job_type = repo_entry.job_type().as_str();
+
     if benchmarks.is_empty() {
-        // No defaults configured — insert a single standard job (runner uses its own default)
+        // No defaults configured — insert a single job (runner uses its own default)
         let benchmarks_json = serde_json::to_string(&benchmarks)?;
         db::insert_job(
             pool,
@@ -325,18 +317,13 @@ async fn process_comment(
                 changed_env_vars: &changed_env_json,
                 baseline_ref: request.baseline_ref.as_deref(),
                 changed_ref: request.changed_ref.as_deref(),
-                job_type: "standard",
+                job_type,
             },
         )
         .await?;
     } else {
-        // Group benchmarks by type
+        // One job per benchmark so each runs in its own pod.
         for bench in &benchmarks {
-            let job_type = repo_entry
-                .classify_benchmark(bench)
-                .map(|jt| jt.as_str())
-                .unwrap_or("standard");
-
             let single_bench = serde_json::to_string(&[bench])?;
             db::insert_job(
                 pool,

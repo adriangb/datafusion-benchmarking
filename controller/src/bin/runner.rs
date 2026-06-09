@@ -9,7 +9,7 @@ use tracing::{error, info};
 use benchmark_controller::github;
 use benchmark_controller::runner::config::{BenchType, RunnerConfig};
 use benchmark_controller::runner::poster::CommentPoster;
-use benchmark_controller::runner::{bench_arrow, bench_criterion, bench_standard, shell};
+use benchmark_controller::runner::{bench_arrow, bench_datafusion, shell};
 
 #[tokio::main]
 async fn main() {
@@ -58,8 +58,9 @@ async fn main() {
 
 async fn run_benchmark(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     match config.bench_type {
-        BenchType::Standard | BenchType::MainTracking => bench_standard::run(config, poster).await,
-        BenchType::Criterion => bench_criterion::run(config, poster).await,
+        BenchType::Datafusion | BenchType::MainTracking => {
+            bench_datafusion::run(config, poster).await
+        }
         BenchType::ArrowCriterion => bench_arrow::run(config, poster).await,
     }
 }

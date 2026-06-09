@@ -139,6 +139,11 @@ show benchmark queue
 
 ## Supported Benchmarks
 
+There is no allowlist: any name you pass is scheduled and resolved on the
+runner. Names that match a Criterion `[[bench]]` target run via Criterion;
+everything else runs through `bench.sh`. A name that matches neither fails on
+the runner. The tables below list the benchmarks known to work today.
+
 ### DataFusion (standard)
 
 | Benchmark | Description |
@@ -190,7 +195,7 @@ controller/                Rust controller crate
     github_poller.rs       Comment polling loop
     job_manager.rs         K8s Job lifecycle reconciler
     db.rs                  SQLite queries (jobs, seen comments, scan state)
-    benchmarks.rs          Trigger parsing, benchmark allowlists
+    benchmarks.rs          Trigger parsing (no allowlist — any name is accepted)
   migrations/              SQLite schema
 runner/                    Benchmark runner container (builds project, runs benchmarks, posts results)
 queries/                   SQL query files for ClickBench
@@ -293,7 +298,7 @@ One-time setup for GitHub Actions → GCP authentication:
 | `github_poller` | Poll GitHub API, detect triggers, insert jobs |
 | `job_manager` | Create K8s Jobs, monitor status, post results |
 | `db` | SQLite persistence (jobs, seen comments, scan state) |
-| `benchmarks` | Trigger parsing, per-repo allowlists, classification |
+| `benchmarks` | Trigger parsing (no allowlist; benchmarks resolved on the runner) |
 | `github` | GitHub REST API client (comments, reactions) |
 | `config` | Environment-based configuration |
 
