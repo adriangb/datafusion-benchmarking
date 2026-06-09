@@ -426,9 +426,9 @@ async fn create_k8s_job(
         env.push(env_var("CHANGED_REF", changed_ref));
     }
 
-    // For criterion benchmarks, set BENCH_NAME to the first benchmark
-    if (job.job_type == "criterion" || job.job_type == "arrow_criterion") && !benchmarks.is_empty()
-    {
+    // The arrow runner benches a single named target; the datafusion runner
+    // reads the BENCHMARKS list and resolves each name itself.
+    if job.job_type == "arrow_criterion" && !benchmarks.is_empty() {
         env.push(env_var("BENCH_NAME", benchmarks[0].clone()));
     }
 

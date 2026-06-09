@@ -1,8 +1,7 @@
-//! Benchmark trigger detection and per-repo allowlists.
+//! Benchmark trigger detection.
 //!
-//! Parses PR comment bodies for "run benchmark …" trigger phrases, validates
-//! benchmark names against repo-specific allowlists, and classifies them by
-//! [`JobType`].
+//! Parses PR comment bodies for "run benchmark …" trigger phrases. There is no
+//! allowlist: any requested name is accepted and resolved on the runner.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,8 +9,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::config::RepoEntry;
-use crate::models::{BenchmarkRequest, JobType};
+use crate::models::BenchmarkRequest;
 
 /// Unified trigger regex: matches `run benchmark(s) [name1 name2 ...]`.
 static TRIGGER_RE: Lazy<Regex> = Lazy::new(|| {
@@ -42,23 +40,6 @@ pub enum DetectResult {
     ConfigError(String),
     /// Not a trigger at all.
     None,
-}
-
-impl RepoEntry {
-    /// Determine the [`JobType`] for a benchmark name, or `None` if not recognized.
-    pub fn classify_benchmark(&self, name: &str) -> Option<JobType> {
-        if self.standard_set().contains(name) {
-            Some(JobType::Standard)
-        } else if self.criterion_allows_any() || self.criterion_set().contains(name) {
-            if self.criterion_type == "arrow" {
-                Some(JobType::ArrowCriterion)
-            } else {
-                Some(JobType::Criterion)
-            }
-        } else {
-            None
-        }
-    }
 }
 
 /// Parse the extra lines (after the trigger line) into structured env vars and refs.
@@ -165,10 +146,11 @@ pub fn parse_trigger(trigger: &str) -> Option<TriggerKind> {
 ///
 /// Recognizes `run benchmarks` (default suite), `run benchmarks <names>`, and
 /// `run benchmark <names>`. `run benchmark` without names returns `None` (caller
-/// should post a help message).
+/// should post a help message). Any requested names are accepted; there is no
+/// allowlist.
 ///
 /// Supports `baseline:`/`changed:` sections with `env:` and `ref:` sub-entries.
-pub fn detect_benchmark(repo_entry: &RepoEntry, body: &str) -> DetectResult {
+pub fn detect_benchmark(body: &str) -> DetectResult {
     let lines: Vec<&str> = body.trim().lines().collect();
     if lines.is_empty() {
         return DetectResult::None;
@@ -202,26 +184,17 @@ pub fn detect_benchmark(repo_entry: &RepoEntry, body: &str) -> DetectResult {
                 return DetectResult::None;
             }
 
-            let standard = repo_entry.standard_set();
-            let criterion = repo_entry.criterion_set();
-            let criterion_any = repo_entry.criterion_allows_any();
-
-            let all_valid = names.iter().all(|n| {
-                standard.contains(n.as_str()) || criterion_any || criterion.contains(n.as_str())
-            });
-
-            if all_valid {
-                DetectResult::Parsed(BenchmarkRequest {
-                    benchmarks: names,
-                    env_vars: shared_env,
-                    baseline_env_vars: baseline_env,
-                    changed_env_vars: changed_env,
-                    baseline_ref,
-                    changed_ref,
-                })
-            } else {
-                DetectResult::None
-            }
+            // No allowlist: accept any requested names. Names that resolve to
+            // neither a Criterion bench target nor a `bench.sh` suite simply
+            // fail on the runner.
+            DetectResult::Parsed(BenchmarkRequest {
+                benchmarks: names,
+                env_vars: shared_env,
+                baseline_env_vars: baseline_env,
+                changed_env_vars: changed_env,
+                baseline_ref,
+                changed_ref,
+            })
         }
         TriggerKind::SingularNoNames => DetectResult::None,
     }
@@ -249,65 +222,23 @@ pub fn is_queue_request(body: &str) -> bool {
     body.trim().eq_ignore_ascii_case("show benchmark queue")
 }
 
-/// Build a markdown message listing all valid benchmarks for a repo, highlighting any unsupported names.
-pub fn supported_benchmarks_message(repo_entry: &RepoEntry, requested: &[String]) -> String {
-    let standard: Vec<&str> = {
-        let mut v: Vec<&str> = repo_entry.standard.iter().map(|s| s.as_str()).collect();
-        v.sort();
-        v
-    };
-    let criterion: Vec<&str> = {
-        let mut v: Vec<&str> = repo_entry.criterion.iter().map(|s| s.as_str()).collect();
-        v.sort();
-        v
-    };
-
-    let standard_str = if standard.is_empty() {
-        "(none)".to_string()
-    } else {
-        standard.join(", ")
-    };
-    let criterion_any = repo_entry.criterion_allows_any();
-    let criterion_str = if criterion_any {
-        "(any)".to_string()
-    } else if criterion.is_empty() {
-        "(none)".to_string()
-    } else {
-        criterion.join(", ")
-    };
-
-    let standard_set = repo_entry.standard_set();
-    let criterion_set = repo_entry.criterion_set();
-
-    let bad: Vec<&String> = requested
-        .iter()
-        .filter(|n| {
-            !standard_set.contains(n.as_str())
-                && !criterion_any
-                && !criterion_set.contains(n.as_str())
-        })
-        .collect();
-
-    let unsupported = if bad.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nUnsupported benchmarks: {}.",
-            bad.iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    format!(
-        "Supported benchmarks:\n- Standard: {standard_str}\n- Criterion: {criterion_str}\n\n\
-         Usage:\n\
+/// Build the usage/help message shown for malformed triggers and config errors.
+///
+/// There is no allowlist, so this no longer enumerates valid benchmarks — any
+/// name is accepted and resolved on the runner (an unresolvable name fails
+/// there). The benchmark `bench.sh` suites and Criterion benches available are
+/// whatever the target repo defines.
+pub fn usage_message() -> String {
+    "Usage:\n\
          ```\n\
          run benchmark <name>           # run specific benchmark(s)\n\
          run benchmarks                 # run default suite\n\
          run benchmarks <name1> <name2> # run specific benchmarks\n\
-         ```\n\n\
+         ```\n\
+         Any benchmark name is accepted: `bench.sh` suite names (e.g. `tpch`, \
+         `clickbench_partitioned`, `wide_schema`) and Criterion bench targets \
+         (e.g. `sql_planner`) are resolved automatically. A name that matches \
+         neither fails on the runner.\n\n\
          Per-side configuration (`run benchmark tpch` followed by):\n\
          ```yaml\n\
          env:\n\
@@ -325,8 +256,8 @@ pub fn supported_benchmarks_message(repo_entry: &RepoEntry, requested: &[String]
            ref: v46.0.0\n\
            env:\n\
              DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G\n\
-         ```{unsupported}"
-    )
+         ```"
+    .to_string()
 }
 
 /// Format the allowlist as a comma-separated list of GitHub profile links.
@@ -343,30 +274,12 @@ pub fn allowed_users_markdown(allowed_users: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RepoEntry;
+    use crate::models::JobType;
 
     fn df_entry() -> RepoEntry {
         RepoEntry {
-            standard: vec![
-                "tpch".into(),
-                "tpch10".into(),
-                "tpch_mem".into(),
-                "tpch_mem10".into(),
-                "topk_tpch".into(),
-                "clickbench_partitioned".into(),
-                "clickbench_extended".into(),
-                "clickbench_1".into(),
-                "clickbench_pushdown".into(),
-                "external_aggr".into(),
-                "tpcds".into(),
-                "smj".into(),
-                "sort_pushdown".into(),
-                "sort_pushdown_sorted".into(),
-                "sort_pushdown_inexact".into(),
-                "sort_pushdown_inexact_unsorted".into(),
-                "sort_pushdown_inexact_overlap".into(),
-            ],
-            criterion: vec!["sql_planner".into(), "in_list".into(), "case_when".into()],
-            criterion_type: "datafusion".into(),
+            kind: "datafusion".into(),
             default_standard: vec![
                 "clickbench_partitioned".into(),
                 "tpcds".into(),
@@ -377,19 +290,8 @@ mod tests {
 
     fn arrow_entry() -> RepoEntry {
         RepoEntry {
-            standard: vec![],
-            criterion: vec!["arrow_reader".into(), "arrow_writer".into()],
-            criterion_type: "arrow".into(),
+            kind: "arrow".into(),
             default_standard: vec![],
-        }
-    }
-
-    fn wildcard_criterion_entry() -> RepoEntry {
-        RepoEntry {
-            standard: vec!["tpch".into()],
-            criterion: vec!["*".into()],
-            criterion_type: "datafusion".into(),
-            default_standard: vec!["tpch".into()],
         }
     }
 
@@ -414,7 +316,7 @@ mod tests {
 
     #[test]
     fn detect_default_suite() {
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), "run benchmarks"));
+        let req = unwrap_parsed(detect_benchmark("run benchmarks"));
         assert!(req.benchmarks.is_empty());
         assert!(req.env_vars.is_empty());
     }
@@ -422,7 +324,7 @@ mod tests {
     #[test]
     fn detect_default_suite_with_env_vars() {
         let body = "run benchmarks\nenv:\n  DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert!(req.benchmarks.is_empty());
         assert_eq!(
             req.env_vars.get("DATAFUSION_RUNTIME_MEMORY_LIMIT").unwrap(),
@@ -432,77 +334,53 @@ mod tests {
 
     #[test]
     fn detect_single_named() {
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), "run benchmark tpch_mem"));
+        let req = unwrap_parsed(detect_benchmark("run benchmark tpch_mem"));
         assert_eq!(req.benchmarks, vec!["tpch_mem"]);
     }
 
     #[test]
     fn detect_multiple_named() {
-        let req = unwrap_parsed(detect_benchmark(
-            &df_entry(),
-            "run benchmark tpch_mem tpch10",
-        ));
+        let req = unwrap_parsed(detect_benchmark("run benchmark tpch_mem tpch10"));
         assert_eq!(req.benchmarks, vec!["tpch_mem", "tpch10"]);
     }
 
     #[test]
     fn detect_criterion_benchmark() {
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), "run benchmark sql_planner"));
+        let req = unwrap_parsed(detect_benchmark("run benchmark sql_planner"));
         assert_eq!(req.benchmarks, vec!["sql_planner"]);
     }
 
     #[test]
-    fn detect_bogus_name_returns_none() {
-        assert!(is_none(&detect_benchmark(
-            &df_entry(),
-            "run benchmark bogus_name"
-        )));
-    }
+    fn detect_any_name_is_accepted() {
+        // No allowlist: previously-unknown names now parse and are scheduled.
+        let req = unwrap_parsed(detect_benchmark("run benchmark anything_goes"));
+        assert_eq!(req.benchmarks, vec!["anything_goes"]);
 
-    #[test]
-    fn detect_one_invalid_rejects_all() {
-        assert!(is_none(&detect_benchmark(
-            &df_entry(),
-            "run benchmark tpch_mem bogus"
-        )));
+        let req = unwrap_parsed(detect_benchmark("run benchmark tpch_mem bogus"));
+        assert_eq!(req.benchmarks, vec!["tpch_mem", "bogus"]);
     }
 
     #[test]
     fn detect_not_a_trigger() {
-        assert!(is_none(&detect_benchmark(&df_entry(), "hello world")));
+        assert!(is_none(&detect_benchmark("hello world")));
     }
 
     #[test]
     fn detect_empty_string() {
-        assert!(is_none(&detect_benchmark(&df_entry(), "")));
+        assert!(is_none(&detect_benchmark("")));
     }
 
     #[test]
     fn detect_case_insensitive() {
-        assert!(is_parsed(&detect_benchmark(&df_entry(), "Run Benchmarks")));
-        assert!(is_parsed(&detect_benchmark(
-            &df_entry(),
-            "RUN BENCHMARK tpch"
-        )));
-    }
-
-    #[test]
-    fn detect_arrow_criterion() {
-        let req = unwrap_parsed(detect_benchmark(
-            &arrow_entry(),
-            "run benchmark arrow_reader",
-        ));
-        assert_eq!(req.benchmarks, vec!["arrow_reader"]);
+        assert!(is_parsed(&detect_benchmark("Run Benchmarks")));
+        assert!(is_parsed(&detect_benchmark("RUN BENCHMARK tpch")));
     }
 
     // ── plural trigger with names (new) ─────────────────────────────
 
     #[test]
     fn detect_plural_with_names() {
-        let req = unwrap_parsed(detect_benchmark(
-            &df_entry(),
-            "run benchmarks tpch clickbench_1",
-        ));
+        let req = unwrap_parsed(detect_benchmark("run benchmarks tpch clickbench_1"));
         assert_eq!(req.benchmarks, vec!["tpch", "clickbench_1"]);
     }
 
@@ -510,7 +388,7 @@ mod tests {
 
     #[test]
     fn detect_singular_no_names_returns_none() {
-        assert!(is_none(&detect_benchmark(&df_entry(), "run benchmark")));
+        assert!(is_none(&detect_benchmark("run benchmark")));
     }
 
     #[test]
@@ -526,7 +404,7 @@ mod tests {
     #[test]
     fn parse_baseline_changed_env_vars() {
         let body = "run benchmark tpch\nbaseline:\n  env:\n    DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G\nchanged:\n  env:\n    DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert_eq!(
             req.baseline_env_vars
                 .get("DATAFUSION_RUNTIME_MEMORY_LIMIT")
@@ -545,7 +423,7 @@ mod tests {
     #[test]
     fn parse_baseline_ref() {
         let body = "run benchmarks tpch clickbench_1\nbaseline:\n  ref: abc1234def";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert_eq!(req.baseline_ref.as_deref(), Some("abc1234def"));
         assert!(req.changed_ref.is_none());
     }
@@ -553,7 +431,7 @@ mod tests {
     #[test]
     fn parse_both_refs_with_env() {
         let body = "run benchmark tpch\nbaseline:\n  ref: v45.0.0\n  env:\n    FOO: old_value\nchanged:\n  ref: v46.0.0\n  env:\n    FOO: new_value";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert_eq!(req.baseline_ref.as_deref(), Some("v45.0.0"));
         assert_eq!(req.changed_ref.as_deref(), Some("v46.0.0"));
         assert_eq!(req.baseline_env_vars.get("FOO").unwrap(), "old_value");
@@ -563,7 +441,7 @@ mod tests {
     #[test]
     fn parse_shared_plus_per_side() {
         let body = "run benchmark tpch\nenv:\n  SHARED_SETTING: enabled\nbaseline:\n  env:\n    DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G\nchanged:\n  env:\n    DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert_eq!(req.env_vars.get("SHARED_SETTING").unwrap(), "enabled");
         assert_eq!(
             req.baseline_env_vars
@@ -582,7 +460,7 @@ mod tests {
     #[test]
     fn parse_explicit_env_section() {
         let body = "run benchmark tpch\nenv:\n  DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert_eq!(
             req.env_vars.get("DATAFUSION_RUNTIME_MEMORY_LIMIT").unwrap(),
             "1G"
@@ -592,7 +470,7 @@ mod tests {
     #[test]
     fn parse_yaml_fenced_block() {
         let body = "run benchmark tpch\n```yaml\nbaseline:\n  ref: v45.0.0\n  env:\n    FOO: bar\nchanged:\n  ref: v46.0.0\n```";
-        let req = unwrap_parsed(detect_benchmark(&df_entry(), body));
+        let req = unwrap_parsed(detect_benchmark(body));
         assert_eq!(req.baseline_ref.as_deref(), Some("v45.0.0"));
         assert_eq!(req.changed_ref.as_deref(), Some("v46.0.0"));
         assert_eq!(req.baseline_env_vars.get("FOO").unwrap(), "bar");
@@ -601,7 +479,7 @@ mod tests {
     #[test]
     fn parse_unknown_field_returns_config_error() {
         let body = "run benchmark tpch\ncurrent:\n  ref: HEAD";
-        match detect_benchmark(&df_entry(), body) {
+        match detect_benchmark(body) {
             DetectResult::ConfigError(e) => {
                 assert!(e.contains("unknown field"), "error was: {e}");
             }
@@ -614,6 +492,27 @@ mod tests {
                 }
             ),
         }
+    }
+
+    // ── RepoEntry::job_type ─────────────────────────────────────────
+
+    #[test]
+    fn job_type_datafusion_repo() {
+        assert_eq!(df_entry().job_type(), JobType::Datafusion);
+    }
+
+    #[test]
+    fn job_type_arrow_repo() {
+        assert_eq!(arrow_entry().job_type(), JobType::ArrowCriterion);
+    }
+
+    // ── usage_message ───────────────────────────────────────────────
+
+    #[test]
+    fn usage_message_has_usage_and_no_allowlist() {
+        let msg = usage_message();
+        assert!(msg.contains("run benchmark"));
+        assert!(msg.contains("Any benchmark name is accepted"));
     }
 
     // ── is_benchmark_trigger ────────────────────────────────────────
@@ -663,86 +562,6 @@ mod tests {
     #[test]
     fn queue_request_wrong_phrase() {
         assert!(!is_queue_request("run benchmarks"));
-    }
-
-    // ── RepoEntry::classify_benchmark ──────────────────────────────
-
-    #[test]
-    fn classify_df_standard() {
-        assert_eq!(
-            df_entry().classify_benchmark("tpch"),
-            Some(JobType::Standard)
-        );
-    }
-
-    #[test]
-    fn classify_df_criterion() {
-        assert_eq!(
-            df_entry().classify_benchmark("sql_planner"),
-            Some(JobType::Criterion)
-        );
-    }
-
-    #[test]
-    fn classify_df_bogus() {
-        assert_eq!(df_entry().classify_benchmark("bogus"), None);
-    }
-
-    #[test]
-    fn classify_arrow_criterion() {
-        assert_eq!(
-            arrow_entry().classify_benchmark("arrow_reader"),
-            Some(JobType::ArrowCriterion)
-        );
-    }
-
-    // ── wildcard criterion ──────────────────────────────────────────
-
-    #[test]
-    fn detect_wildcard_criterion_accepts_any_name() {
-        let req = unwrap_parsed(detect_benchmark(
-            &wildcard_criterion_entry(),
-            "run benchmark anything_goes",
-        ));
-        assert_eq!(req.benchmarks, vec!["anything_goes"]);
-    }
-
-    #[test]
-    fn classify_wildcard_criterion() {
-        assert_eq!(
-            wildcard_criterion_entry().classify_benchmark("any_bench_name"),
-            Some(JobType::Criterion)
-        );
-    }
-
-    #[test]
-    fn classify_wildcard_standard_still_works() {
-        assert_eq!(
-            wildcard_criterion_entry().classify_benchmark("tpch"),
-            Some(JobType::Standard)
-        );
-    }
-
-    #[test]
-    fn supported_msg_wildcard_shows_any() {
-        let msg =
-            supported_benchmarks_message(&wildcard_criterion_entry(), &["unknown".to_string()]);
-        assert!(msg.contains("(any)"));
-        assert!(!msg.contains("Unsupported"));
-    }
-
-    // ── supported_benchmarks_message ────────────────────────────────
-
-    #[test]
-    fn supported_msg_no_unsupported() {
-        let msg = supported_benchmarks_message(&df_entry(), &[]);
-        assert!(!msg.contains("Unsupported"));
-    }
-
-    #[test]
-    fn supported_msg_with_unsupported() {
-        let msg = supported_benchmarks_message(&df_entry(), &["bogus".to_string()]);
-        assert!(msg.contains("Unsupported benchmarks: bogus"));
     }
 
     // ── allowed_users_markdown ──────────────────────────────────────

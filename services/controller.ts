@@ -191,44 +191,27 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                 "mzabaluev", "sdf-jkl", "liamzwbao", "cetra3", "brunal",
                 "Fokko", "kunalsinghdadhwal", "grtlr", "codephage2020", "asubiotto",
               ],
+              // No benchmark allowlist: any requested name is scheduled and
+              // resolved on the runner. `kind` selects how the repo runs
+              // (datafusion = bench.sh + Criterion, resolved per-benchmark;
+              // arrow = arrow-rs Criterion). `default_standard` is the suite
+              // used by a bare `run benchmarks`.
               repos: {
                 "adriangb/datafusion": {
-                  standard: [
-                    "tpch", "tpch10", "tpch_mem", "tpch_mem10",
-                    "topk_tpch",
-                    "clickbench_partitioned", "clickbench_extended",
-                    "clickbench_1", "clickbench_pushdown",
-                    "external_aggr", "tpcds", "smj", "sort_pushdown",
-                    "sort_pushdown_sorted", "sort_pushdown_inexact",
-                    "sort_pushdown_inexact_unsorted", "sort_pushdown_inexact_overlap",
-                    "wide_schema", "predicate_eval",
-                  ],
+                  kind: "datafusion",
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
                   ],
-                  criterion: ["*"],
                 },
                 "apache/datafusion": {
-                  standard: [
-                    "tpch", "tpch10", "tpch_mem", "tpch_mem10",
-                    "topk_tpch",
-                    "clickbench_partitioned", "clickbench_extended",
-                    "clickbench_1", "clickbench_pushdown",
-                    "external_aggr", "tpcds", "smj", "sort_pushdown",
-                    "sort_pushdown_sorted", "sort_pushdown_inexact",
-                    "sort_pushdown_inexact_unsorted", "sort_pushdown_inexact_overlap",
-                    "wide_schema", "predicate_eval",
-                  ],
+                  kind: "datafusion",
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
                   ],
-                  criterion: ["*"],
                 },
                 "apache/arrow-rs": {
-                  standard: [],
+                  kind: "arrow",
                   default_standard: [],
-                  criterion: ["*"],
-                  criterion_type: "arrow",
                 },
               },
             }) },

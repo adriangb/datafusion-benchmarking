@@ -1,28 +1,35 @@
-//! Standard bench.sh benchmark runner — ports `run_bench_sh.sh`.
+//! Unified DataFusion benchmark runner.
+//!
+//! There is no benchmark allowlist and no per-name classification baked into
+//! the controller. For each requested benchmark the runner resolves how to run
+//! it at runtime:
+//!
+//! * If the name is a real Criterion `[[bench]]` target in the `benchmarks`
+//!   crate (discovered via `cargo metadata`), it is run with
+//!   `cargo bench --bench <name> -- --save-baseline <side>`.
+//! * Otherwise it is run through `bench.sh run <name>` (TPC-H variants take a
+//!   direct `dfbench` shortcut). `bench.sh` itself runs some suites through the
+//!   Criterion SQL harness (`wide_schema`, …) and others through `dfbench`.
+//!
+//! Comparison is then driven by the artifacts each run actually produced, not
+//! by the benchmark name: `results/<side>/*.json` is diffed with
+//! `bench.sh compare_detail`, and `target/criterion` baselines are diffed with
+//! `critcmp`. A run mixing both families emits both sections.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::github;
-use crate::runner::bench_criterion::copy_criterion_baselines;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
 use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
 
-/// Benchmarks orchestrated by `bench.sh` but executed through the Criterion SQL
-/// harness (`cargo bench --bench sql`). Unlike the dfbench-based suites, these
-/// write timings to `target/criterion/` rather than `results/*.json`, so they
-/// are compared with `critcmp` (against per-side `--save-baseline`s) instead of
-/// `bench.sh compare_detail`.
-fn is_criterion_harness(bench: &str) -> bool {
-    matches!(bench, "wide_schema" | "predicate_eval")
-}
-
-/// Run standard bench.sh benchmarks comparing a PR branch to its merge-base.
+/// Run DataFusion benchmarks comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     let repo_url = config.repo_url();
     let benchmarks = &config.benchmarks;
@@ -63,23 +70,34 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     // Pre-install stable toolchain to avoid rustup race in parallel builds
     git::rustup_stable().await?;
 
-    // Compile both in parallel
-    info!("=== Compiling PR branch and merge-base in parallel ===");
-    let branch_benchmarks = branch_dir.join("benchmarks");
-    let branch_build = shell::spawn_command(
-        "cargo",
-        &["build", "--release", "--bin", "dfbench"],
-        &branch_benchmarks,
-        "/tmp/branch_build.log",
-    );
+    // Resolve which requested names are real Criterion bench targets. Anything
+    // else runs through bench.sh. Resolved from the branch checkout so a new
+    // bench target added in the PR is recognized.
+    let requested: Vec<String> = benchmarks.split_whitespace().map(String::from).collect();
+    let bench_targets = criterion_bench_targets(&branch_dir.join("benchmarks")).await;
+    let is_criterion = |bench: &str| bench_targets.contains(bench);
+    let any_shell = requested.iter().any(|b| !is_criterion(b));
 
-    let base_benchmarks = base_dir.join("benchmarks");
-    let base_build = shell::spawn_command(
-        "cargo",
-        &["build", "--release", "--bin", "dfbench"],
-        &base_benchmarks,
-        "/tmp/base_build.log",
-    );
+    // dfbench is only needed for the bench.sh / TPC-H path. Build it for both
+    // sides in parallel; skip entirely for Criterion-only runs.
+    let builds = if any_shell {
+        info!("=== Compiling dfbench for PR branch and merge-base in parallel ===");
+        let branch_build = shell::spawn_command(
+            "cargo",
+            &["build", "--release", "--bin", "dfbench"],
+            &branch_dir.join("benchmarks"),
+            "/tmp/branch_build.log",
+        );
+        let base_build = shell::spawn_command(
+            "cargo",
+            &["build", "--release", "--bin", "dfbench"],
+            &base_dir.join("benchmarks"),
+            "/tmp/base_build.log",
+        );
+        Some((branch_build, base_build))
+    } else {
+        None
+    };
 
     // Post "running" comment
     let uname = shell::uname().await;
@@ -119,55 +137,103 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         .await?;
 
     // Wait for builds
-    info!("=== Waiting for builds ===");
-    branch_build
-        .await
-        .context("branch build task panicked")?
-        .context("branch build failed")?;
-    base_build
-        .await
-        .context("base build task panicked")?
-        .context("base build failed")?;
-    info!("=== Builds complete ===");
-
-    // Set up bench runner from a third checkout
-    info!("=== Setting up bench runner ===");
-    git::clone_shallow(&repo_url, &bench_dir, 200).await?;
-    git::checkout(&bench_dir, "origin/main").await?;
-
-    let bench_benchmarks = bench_dir.join("benchmarks");
-
-    // Clean any prior results
-    let results_dir = bench_benchmarks.join("results");
-    if results_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&results_dir).await;
+    if let Some((branch_build, base_build)) = builds {
+        info!("=== Waiting for builds ===");
+        branch_build
+            .await
+            .context("branch build task panicked")?
+            .context("branch build failed")?;
+        base_build
+            .await
+            .context("base build task panicked")?
+            .context("base build failed")?;
+        info!("=== Builds complete ===");
     }
 
-    // Copy TPC-H expected answer files so bench.sh skips the docker-based copy
-    copy_tpch_answers(&bench_benchmarks).await;
+    // Set up bench runner from a third checkout (only used by the bench.sh path)
+    let bench_benchmarks = bench_dir.join("benchmarks");
+    if any_shell {
+        info!("=== Setting up bench runner ===");
+        git::clone_shallow(&repo_url, &bench_dir, 200).await?;
+        git::checkout(&bench_dir, "origin/main").await?;
+
+        // Clean any prior results
+        let results_dir = bench_benchmarks.join("results");
+        if results_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&results_dir).await;
+        }
+
+        // Copy TPC-H expected answer files so bench.sh skips the docker-based copy
+        copy_tpch_answers(&bench_benchmarks).await;
+    }
 
     // Run each benchmark
-    let mut base_stats_list: Vec<(&str, ResourceStats)> = Vec::new();
-    let mut branch_stats_list: Vec<(&str, ResourceStats)> = Vec::new();
+    let mut base_stats_list: Vec<(String, ResourceStats)> = Vec::new();
+    let mut branch_stats_list: Vec<(String, ResourceStats)> = Vec::new();
 
     let bench_dir_str = bench_benchmarks.to_string_lossy().to_string();
 
     let baseline_extra_env = config.baseline_env_args();
     let changed_extra_env = config.changed_env_args();
 
-    // Explicit RESULTS_NAME ensures bench.sh saves to a predictable directory,
-    // regardless of whether DATAFUSION_DIR is on a branch or detached HEAD.
+    // Explicit RESULTS_NAME / baseline name ensures bench.sh and Criterion save
+    // to a predictable location per side, regardless of branch vs detached HEAD.
     let base_results_name = "HEAD".to_string();
     let bench_branch_name = git::sanitize_branch_name(&branch_name);
 
-    for bench in benchmarks.split_whitespace() {
+    // Track whether any Criterion baselines were produced per side, so the
+    // comparison can pick `critcmp HEAD <branch>` vs a branch-only `critcmp`.
+    let mut criterion_base_ok = false;
+    let mut criterion_branch_ok = false;
+
+    for bench in &requested {
+        if is_criterion(bench) {
+            info!("** Setting up data for criterion bench {bench} **");
+            setup_criterion_data(bench, &branch_dir, &base_dir).await;
+
+            info!("** Running {bench} baseline (criterion) **");
+            match run_criterion_side(
+                bench,
+                &base_dir,
+                &base_results_name,
+                &config.bench_filter,
+                &baseline_extra_env,
+            )
+            .await
+            {
+                Ok(stats) => {
+                    criterion_base_ok = true;
+                    base_stats_list.push((bench.clone(), stats));
+                }
+                Err(e) => {
+                    // Most likely a new bench target absent on the base — fall
+                    // back to a branch-only comparison for it.
+                    warn!("Criterion baseline for {bench} failed (new bench?): {e:#}");
+                }
+            }
+
+            info!("** Running {bench} branch (criterion) **");
+            let stats = run_criterion_side(
+                bench,
+                &branch_dir,
+                &bench_branch_name,
+                &config.bench_filter,
+                &changed_extra_env,
+            )
+            .await
+            .with_context(|| format!("run {bench} (branch, criterion)"))?;
+            criterion_branch_ok = true;
+            branch_stats_list.push((bench.clone(), stats));
+            continue;
+        }
+
         info!("** Creating data if needed for {bench} **");
         cache_data(bench, &bench_dir_str).await;
 
         info!("** Running {bench} baseline **");
         let base_spill_dir = PathBuf::from(format!("/workspace/spill-base-{bench}"));
         let _ = tokio::fs::create_dir_all(&base_spill_dir).await;
-        let base_stats = run_one_side(
+        let base_stats = run_shell_side(
             bench,
             &base_dir,
             &bench_benchmarks,
@@ -178,12 +244,12 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         .await
         .with_context(|| format!("run {bench} (base)"))?;
         let _ = tokio::fs::remove_dir_all(&base_spill_dir).await;
-        base_stats_list.push((bench, base_stats));
+        base_stats_list.push((bench.clone(), base_stats));
 
         info!("** Running {bench} branch **");
         let branch_spill_dir = PathBuf::from(format!("/workspace/spill-branch-{bench}"));
         let _ = tokio::fs::create_dir_all(&branch_spill_dir).await;
-        let branch_stats = run_one_side(
+        let branch_stats = run_shell_side(
             bench,
             &branch_dir,
             &bench_benchmarks,
@@ -194,19 +260,16 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         .await
         .with_context(|| format!("run {bench} (branch)"))?;
         let _ = tokio::fs::remove_dir_all(&branch_spill_dir).await;
-        branch_stats_list.push((bench, branch_stats));
+        branch_stats_list.push((bench.clone(), branch_stats));
     }
 
-    // Compare and post results. dfbench-based suites are compared from their
-    // results/*.json via `bench.sh compare_detail`; Criterion-harness suites
-    // (which only produce target/criterion) are compared with `critcmp`.
-    let ran: Vec<&str> = benchmarks.split_whitespace().collect();
-    let has_standard = ran.iter().any(|b| !is_criterion_harness(b));
-    let has_criterion = ran.iter().any(|b| is_criterion_harness(b));
-
+    // Compare and post results, driven by the artifacts that were produced:
+    //   - results/*.json (dfbench suites) → `bench.sh compare_detail`
+    //   - target/criterion baselines (Criterion targets + the bench.sh SQL
+    //     harness) → `critcmp`
     let mut report = String::new();
 
-    if has_standard {
+    if any_shell && results_have_json(&bench_benchmarks, &base_results_name).await {
         let detail = shell::run_command(
             "./bench.sh",
             &["compare_detail", &base_results_name, &bench_branch_name],
@@ -217,17 +280,30 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         report.push_str(&detail);
     }
 
-    if has_criterion {
-        // Gather both sides' baselines into one target/criterion tree, then
-        // diff the base ("HEAD") and branch baselines.
-        copy_criterion_baselines(&base_dir, &branch_dir).await;
-        let critcmp = shell::run_command(
-            "critcmp",
-            &[base_results_name.as_str(), bench_branch_name.as_str()],
-            &branch_dir,
-        )
-        .await
-        .context("critcmp")?;
+    // Criterion output (from either path) lands under <side>/target/criterion.
+    criterion_branch_ok = criterion_branch_ok || criterion_dir_present(&branch_dir).await;
+    criterion_base_ok = criterion_base_ok || criterion_dir_present(&base_dir).await;
+    if criterion_branch_ok {
+        let critcmp = if criterion_base_ok {
+            // Gather both sides' baselines into one tree, then diff them.
+            copy_criterion_baselines(&base_dir, &branch_dir).await;
+            shell::run_command(
+                "critcmp",
+                &[base_results_name.as_str(), bench_branch_name.as_str()],
+                &branch_dir,
+            )
+            .await
+            .context("critcmp")?
+        } else {
+            // No baseline available (e.g. a brand-new bench) — branch-only.
+            let mut out = String::from("New benchmark — branch-only Criterion results:\n\n");
+            out.push_str(
+                &shell::run_command("critcmp", &[bench_branch_name.as_str()], &branch_dir)
+                    .await
+                    .context("critcmp")?,
+            );
+            out
+        };
         if !report.is_empty() {
             report.push('\n');
         }
@@ -251,7 +327,93 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     Ok(())
 }
 
-/// Run a single benchmark on one side (base or branch).
+/// Discover Criterion `[[bench]]` target names in the `benchmarks` crate via
+/// `cargo metadata`. Returns an empty set on any failure — the caller then
+/// treats every name as a `bench.sh` suite (which itself reports unknown
+/// names), so a metadata hiccup degrades gracefully rather than misrouting.
+async fn criterion_bench_targets(crate_dir: &Path) -> HashSet<String> {
+    let out = match shell::run_command(
+        "cargo",
+        &["metadata", "--no-deps", "--format-version", "1"],
+        crate_dir,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            warn!("cargo metadata failed; treating all benches as bench.sh suites: {e:#}");
+            return HashSet::new();
+        }
+    };
+    parse_bench_targets(&out)
+}
+
+/// Extract names of `bench`-kind targets from `cargo metadata` JSON.
+fn parse_bench_targets(metadata_json: &str) -> HashSet<String> {
+    let mut targets = HashSet::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return targets;
+    };
+    let Some(packages) = value.get("packages").and_then(|p| p.as_array()) else {
+        return targets;
+    };
+    for pkg in packages {
+        let Some(pkg_targets) = pkg.get("targets").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        for target in pkg_targets {
+            let is_bench = target
+                .get("kind")
+                .and_then(|k| k.as_array())
+                .map(|kinds| kinds.iter().any(|k| k.as_str() == Some("bench")))
+                .unwrap_or(false);
+            if is_bench {
+                if let Some(name) = target.get("name").and_then(|n| n.as_str()) {
+                    targets.insert(name.to_string());
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Run a Criterion bench target on one side, saving a named baseline.
+///
+/// A non-empty `bench_filter` (from the `BENCH_FILTER` env var) is passed
+/// through to Criterion as a test-name filter.
+async fn run_criterion_side(
+    bench: &str,
+    side_dir: &Path,
+    baseline_name: &str,
+    bench_filter: &str,
+    extra_env: &[String],
+) -> Result<ResourceStats> {
+    let mut bench_args: Vec<String> = vec![
+        "bench".into(),
+        "--features=parquet".into(),
+        "--bench".into(),
+        bench.into(),
+        "--".into(),
+        "--save-baseline".into(),
+        baseline_name.into(),
+    ];
+    if !bench_filter.is_empty() {
+        bench_args.push(bench_filter.to_string());
+    }
+    let (_, stats) = if extra_env.is_empty() {
+        let args_ref: Vec<&str> = bench_args.iter().map(|s| s.as_str()).collect();
+        shell::run_command_monitored("cargo", &args_ref, side_dir, None).await?
+    } else {
+        let mut env_args: Vec<String> = extra_env.to_vec();
+        env_args.push("cargo".to_string());
+        env_args.extend(bench_args);
+        let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
+        shell::run_command_monitored("env", &env_args_ref, side_dir, None).await?
+    };
+    Ok(stats)
+}
+
+/// Run a single `bench.sh` benchmark on one side (base or branch).
 ///
 /// For TPC-H variants we bypass `bench.sh run` and invoke the prebuilt `dfbench`
 /// binary directly. Upstream PR apache/datafusion#21707 ported `bench.sh`'s
@@ -262,7 +424,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
 /// `bench_dir/benchmarks/results/`). The `dfbench tpch` subcommand still
 /// exists upstream, so we call it directly with the same args the old
 /// `run_tpch` used. Other benchmarks continue through `bench.sh`.
-async fn run_one_side(
+async fn run_shell_side(
     bench: &str,
     side_dir: &Path,
     bench_benchmarks: &Path,
@@ -286,14 +448,12 @@ async fn run_one_side(
             format!("DATAFUSION_DIR={}", side_dir.display()),
             format!("RESULTS_NAME={results_name}"),
             format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
+            // Suites that bench.sh runs through the Criterion SQL harness read
+            // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
+            // dfbench-based suites (which never read it) and saves a named
+            // baseline per side for the ones that do, so we can critcmp them.
+            format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
         ];
-        // Criterion-harness suites don't emit results/*.json; have them save a
-        // named Criterion baseline per side so we can compare with critcmp.
-        if is_criterion_harness(bench) {
-            args.push(format!(
-                "SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"
-            ));
-        }
         args.extend(extra_env.iter().cloned());
         args.extend([
             "./bench.sh".to_string(),
@@ -400,6 +560,78 @@ async fn run_tpch_direct(
     Ok(stats)
 }
 
+/// Datasets a Criterion bench target needs generated before it can run.
+fn required_datasets(bench_name: &str) -> &'static [&'static str] {
+    match bench_name {
+        "sql_planner" => &["clickbench_partitioned"],
+        _ => &[],
+    }
+}
+
+/// Generate the data a Criterion bench needs, once in the branch checkout, and
+/// symlink it into the base checkout so both sides share the same inputs.
+async fn setup_criterion_data(bench: &str, branch_dir: &Path, base_dir: &Path) {
+    let datasets = required_datasets(bench);
+    if datasets.is_empty() {
+        return;
+    }
+
+    let branch_benchmarks = branch_dir.join("benchmarks");
+    let bench_dir_str = branch_benchmarks.to_string_lossy().to_string();
+    for dataset in datasets {
+        info!("Setting up data for {dataset}");
+        cache_data(dataset, &bench_dir_str).await;
+    }
+
+    let branch_data = branch_benchmarks.join("data");
+    let base_data = base_dir.join("benchmarks/data");
+    if branch_data.exists() && !base_data.exists() {
+        info!("Symlinking benchmark data into base directory");
+        let _ = tokio::fs::symlink(&branch_data, &base_data).await;
+    }
+}
+
+/// Copy Criterion baselines from base into the branch target tree so a single
+/// `critcmp` invocation can see both sides.
+async fn copy_criterion_baselines(base_dir: &Path, branch_dir: &Path) {
+    let src = base_dir.join("target/criterion");
+    let dst = branch_dir.join("target/criterion");
+    if src.exists() {
+        let _ = shell::run_command(
+            "cp",
+            &[
+                "-r",
+                &format!("{}/.", src.to_string_lossy()),
+                &dst.to_string_lossy(),
+            ],
+            Path::new("/"),
+        )
+        .await;
+    }
+}
+
+/// Whether `<side>/target/criterion` exists (i.e. a Criterion run wrote there).
+async fn criterion_dir_present(side_dir: &Path) -> bool {
+    tokio::fs::metadata(side_dir.join("target/criterion"))
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+}
+
+/// Whether the base side produced any `results/<name>/*.json` (dfbench suites).
+async fn results_have_json(bench_benchmarks: &Path, results_name: &str) -> bool {
+    let dir = bench_benchmarks.join("results").join(results_name);
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Copy TPC-H answer files from the baked-in location into the benchmark data dirs.
 async fn copy_tpch_answers(bench_dir: &Path) {
     let answers_src = Path::new("/data/tpch-answers");
@@ -440,8 +672,8 @@ async fn cache_data(bench: &str, bench_dir: &str) {
 
 /// Build the resource usage section from collected stats.
 fn format_resource_section(
-    base_stats: &[(&str, ResourceStats)],
-    branch_stats: &[(&str, ResourceStats)],
+    base_stats: &[(String, ResourceStats)],
+    branch_stats: &[(String, ResourceStats)],
 ) -> String {
     let mut section = String::new();
     for (bench, stats) in base_stats {
@@ -520,15 +752,41 @@ mod tests {
     }
 
     #[test]
-    fn criterion_harness_classification() {
-        // Criterion SQL-harness suites → compared via critcmp.
-        assert!(is_criterion_harness("wide_schema"));
-        assert!(is_criterion_harness("predicate_eval"));
-        // dfbench/json suites → compared via bench.sh compare_detail.
-        assert!(!is_criterion_harness("tpch"));
-        assert!(!is_criterion_harness("clickbench_1"));
-        assert!(!is_criterion_harness("imdb"));
-        assert!(!is_criterion_harness("h2o"));
+    fn parse_bench_targets_picks_bench_kind() {
+        let json = r#"{
+            "packages": [
+                {"targets": [
+                    {"name": "dfbench", "kind": ["bin"]},
+                    {"name": "sql_planner", "kind": ["bench"]},
+                    {"name": "sql", "kind": ["bench"]},
+                    {"name": "datafusion-benchmarks", "kind": ["lib"]}
+                ]}
+            ]
+        }"#;
+        let targets = parse_bench_targets(json);
+        assert!(targets.contains("sql_planner"));
+        assert!(targets.contains("sql"));
+        assert!(!targets.contains("dfbench"));
+        assert!(!targets.contains("datafusion-benchmarks"));
+    }
+
+    #[test]
+    fn parse_bench_targets_handles_garbage() {
+        assert!(parse_bench_targets("not json").is_empty());
+        assert!(parse_bench_targets("{}").is_empty());
+    }
+
+    #[test]
+    fn required_datasets_sql_planner() {
+        assert_eq!(
+            required_datasets("sql_planner"),
+            &["clickbench_partitioned"]
+        );
+    }
+
+    #[test]
+    fn required_datasets_unknown_is_empty() {
+        assert!(required_datasets("wide_schema").is_empty());
     }
 
     #[test]
