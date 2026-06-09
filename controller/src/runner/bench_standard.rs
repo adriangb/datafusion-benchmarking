@@ -6,11 +6,21 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::github;
+use crate::runner::bench_criterion::copy_criterion_baselines;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
 use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
+
+/// Benchmarks orchestrated by `bench.sh` but executed through the Criterion SQL
+/// harness (`cargo bench --bench sql`). Unlike the dfbench-based suites, these
+/// write timings to `target/criterion/` rather than `results/*.json`, so they
+/// are compared with `critcmp` (against per-side `--save-baseline`s) instead of
+/// `bench.sh compare_detail`.
+fn is_criterion_harness(bench: &str) -> bool {
+    matches!(bench, "wide_schema" | "predicate_eval")
+}
 
 /// Run standard bench.sh benchmarks comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
@@ -187,14 +197,42 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         branch_stats_list.push((bench, branch_stats));
     }
 
-    // Compare and post results
-    let report = shell::run_command(
-        "./bench.sh",
-        &["compare_detail", &base_results_name, &bench_branch_name],
-        &bench_benchmarks,
-    )
-    .await
-    .context("bench.sh compare")?;
+    // Compare and post results. dfbench-based suites are compared from their
+    // results/*.json via `bench.sh compare_detail`; Criterion-harness suites
+    // (which only produce target/criterion) are compared with `critcmp`.
+    let ran: Vec<&str> = benchmarks.split_whitespace().collect();
+    let has_standard = ran.iter().any(|b| !is_criterion_harness(b));
+    let has_criterion = ran.iter().any(|b| is_criterion_harness(b));
+
+    let mut report = String::new();
+
+    if has_standard {
+        let detail = shell::run_command(
+            "./bench.sh",
+            &["compare_detail", &base_results_name, &bench_branch_name],
+            &bench_benchmarks,
+        )
+        .await
+        .context("bench.sh compare")?;
+        report.push_str(&detail);
+    }
+
+    if has_criterion {
+        // Gather both sides' baselines into one target/criterion tree, then
+        // diff the base ("HEAD") and branch baselines.
+        copy_criterion_baselines(&base_dir, &branch_dir).await;
+        let critcmp = shell::run_command(
+            "critcmp",
+            &[base_results_name.as_str(), bench_branch_name.as_str()],
+            &branch_dir,
+        )
+        .await
+        .context("critcmp")?;
+        if !report.is_empty() {
+            report.push('\n');
+        }
+        report.push_str(&critcmp);
+    }
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
     let result_body = format_result_comment(
@@ -249,6 +287,13 @@ async fn run_one_side(
             format!("RESULTS_NAME={results_name}"),
             format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
         ];
+        // Criterion-harness suites don't emit results/*.json; have them save a
+        // named Criterion baseline per side so we can compare with critcmp.
+        if is_criterion_harness(bench) {
+            args.push(format!(
+                "SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"
+            ));
+        }
         args.extend(extra_env.iter().cloned());
         args.extend([
             "./bench.sh".to_string(),
@@ -472,6 +517,18 @@ mod tests {
         assert!(comment.contains("c4a-standard-48"));
         assert!(comment.contains("12 vCPU / 65 GiB"));
         assert!(comment.contains("lscpu output"));
+    }
+
+    #[test]
+    fn criterion_harness_classification() {
+        // Criterion SQL-harness suites → compared via critcmp.
+        assert!(is_criterion_harness("wide_schema"));
+        assert!(is_criterion_harness("predicate_eval"));
+        // dfbench/json suites → compared via bench.sh compare_detail.
+        assert!(!is_criterion_harness("tpch"));
+        assert!(!is_criterion_harness("clickbench_1"));
+        assert!(!is_criterion_harness("imdb"));
+        assert!(!is_criterion_harness("h2o"));
     }
 
     #[test]
