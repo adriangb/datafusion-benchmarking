@@ -204,6 +204,7 @@ dependencies = [
  "chrono",
  "k8s-openapi",
  "kube",
+ "libc",
  "logfire",
  "once_cell",
  "regex",

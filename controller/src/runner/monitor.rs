@@ -1,9 +1,21 @@
-//! Resource monitoring via cgroup v2 files.
+//! Resource monitoring for benchmark execution.
 //!
-//! Captures memory, CPU, and I/O stats during benchmark execution by reading
-//! cgroup v2 files at `/sys/fs/cgroup/`. When cgroup files are unavailable
-//! (e.g. local macOS development), all reads return `None` and stats default
-//! to zero.
+//! When the benchmark command's root pid is known and `/proc` is readable,
+//! both memory and CPU are sampled from its **process subtree** by walking
+//! `/proc/<pid>/status` (summing `VmRSS`) and `/proc/<pid>/stat` (accumulating
+//! `utime`/`stime`), excluding compiler / build-tool processes (`rustc`,
+//! `cargo`, `cc`, `ld`, `sccache`, …). That is what we report. Reading the
+//! pod-wide cgroup (`/sys/fs/cgroup/memory.current`, `cpu.stat`) instead would
+//! also count page cache, leftover build artifacts, and — for benchmarks whose
+//! `bench.sh run` step compiles (e.g. `cargo bench`) — the compiler itself,
+//! which can dwarf the actual query memory and CPU by tens of GB / thousands of
+//! CPU-seconds.
+//!
+//! When the root pid is unknown, or `/proc` can't be read (e.g. a restricted
+//! container), the sampler falls back to the pod-wide cgroup figures: memory
+//! from `memory.current` and CPU from the `cpu.stat` delta over the window.
+//! When neither `/proc` nor the cgroup files are available (e.g. local macOS
+//! development), reads return `None` and stats default to zero.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -92,27 +104,40 @@ struct CpuStat {
     system_usec: u64,
 }
 
-/// Monitors cgroup v2 resource usage during benchmark execution.
+/// Monitors resource usage during benchmark execution.
 pub struct CgroupMonitor {
     start_time: Instant,
     start_memory: u64,
     start_cpu: Option<CpuStat>,
+    root_pid: Option<u32>,
     stop_flag: Arc<AtomicBool>,
     peak_memory: Arc<AtomicU64>,
     memory_sum: Arc<AtomicU64>,
     peak_spill: Arc<AtomicU64>,
     sample_count: Arc<AtomicU64>,
+    // Per-process CPU consumed by the benchmark subtree (excluding build
+    // tools), accumulated in the poll loop. Only meaningful when `proc_ok` is
+    // set; otherwise CPU is taken from the cgroup delta in `finish`.
+    cpu_user_usec: Arc<AtomicU64>,
+    cpu_sys_usec: Arc<AtomicU64>,
+    // Set once any `/proc` subtree sample succeeds. When this stays false (root
+    // pid unknown, or `/proc` unreadable) memory and CPU both come from the
+    // pod-wide cgroup instead.
+    proc_ok: Arc<AtomicBool>,
     poll_handle: JoinHandle<()>,
 }
 
 impl CgroupMonitor {
-    /// Begin monitoring. Snapshots current cgroup values as baselines and
-    /// spawns a background polling task for memory and spill directory tracking.
+    /// Begin monitoring. `root_pid` is the spawned benchmark command's pid;
+    /// both memory and CPU are sampled from its process subtree, excluding
+    /// compiler/build-tool processes — so a `cargo bench` compile inside the
+    /// monitored window is not attributed to the benchmark. When `root_pid` is
+    /// `None`, falls back to the pod-wide cgroup figures.
     ///
     /// If `spill_dir` is provided, the polling loop will also sample the total
     /// size of files in that directory every second to track peak spill usage.
-    pub fn start(spill_dir: Option<PathBuf>) -> Self {
-        let start_memory = read_memory_current().unwrap_or(0);
+    pub fn start(root_pid: Option<u32>, spill_dir: Option<PathBuf>) -> Self {
+        let start_memory = sample_memory(root_pid).unwrap_or(0);
         let start_cpu = read_cpu_stat();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -120,6 +145,9 @@ impl CgroupMonitor {
         let memory_sum = Arc::new(AtomicU64::new(start_memory));
         let peak_spill = Arc::new(AtomicU64::new(0));
         let sample_count = Arc::new(AtomicU64::new(1));
+        let cpu_user_usec = Arc::new(AtomicU64::new(0));
+        let cpu_sys_usec = Arc::new(AtomicU64::new(0));
+        let proc_ok = Arc::new(AtomicBool::new(false));
 
         let poll_handle = {
             let stop = stop_flag.clone();
@@ -127,23 +155,71 @@ impl CgroupMonitor {
             let sum = memory_sum.clone();
             let spill_peak = peak_spill.clone();
             let count = sample_count.clone();
+            let cpu_user = cpu_user_usec.clone();
+            let cpu_sys = cpu_sys_usec.clone();
+            let proc_ok = proc_ok.clone();
 
             tokio::spawn(async move {
+                // Per-pid first/last cumulative CPU ticks, so each benchmark
+                // process contributes only the CPU it burned during the window
+                // (handles process churn as the bench binary starts/exits).
+                let mut cpu_first: std::collections::HashMap<u32, (u64, u64)> =
+                    std::collections::HashMap::new();
+                let mut cpu_last: std::collections::HashMap<u32, (u64, u64)> =
+                    std::collections::HashMap::new();
+
+                // One memory+CPU sample. Prefers the `/proc` subtree; falls back
+                // to the pod-wide cgroup figure when `/proc` can't be read
+                // (root pid unknown, or no `/proc`, e.g. a restricted container).
+                let sample = |cpu_first: &mut std::collections::HashMap<u32, (u64, u64)>,
+                                  cpu_last: &mut std::collections::HashMap<u32, (u64, u64)>| {
+                    if let Some((rss, cpus)) = proc_tree_sample(root_pid) {
+                        proc_ok.store(true, Ordering::Relaxed);
+                        peak.fetch_max(rss, Ordering::Relaxed);
+                        sum.fetch_add(rss, Ordering::Relaxed);
+                        count.fetch_add(1, Ordering::Relaxed);
+
+                        for (pid, utime, stime) in cpus {
+                            cpu_first.entry(pid).or_insert((utime, stime));
+                            cpu_last.insert(pid, (utime, stime));
+                        }
+                        // Recompute accumulated subtree CPU each poll.
+                        let mut tu = 0u64;
+                        let mut ts = 0u64;
+                        for (pid, &(fu, fs)) in &*cpu_first {
+                            if let Some(&(lu, ls)) = cpu_last.get(pid) {
+                                tu += lu.saturating_sub(fu);
+                                ts += ls.saturating_sub(fs);
+                            }
+                        }
+                        cpu_user.store(ticks_to_usec(tu), Ordering::Relaxed);
+                        cpu_sys.store(ticks_to_usec(ts), Ordering::Relaxed);
+                    } else if let Some(current) = read_memory_current() {
+                        // Fallback: pod-wide cgroup memory. CPU comes from the
+                        // cgroup delta in `finish` when `proc_ok` is never set.
+                        peak.fetch_max(current, Ordering::Relaxed);
+                        sum.fetch_add(current, Ordering::Relaxed);
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                };
+
                 while !stop.load(Ordering::Relaxed) {
                     tokio::time::sleep(POLL_INTERVAL).await;
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    if let Some(current) = read_memory_current() {
-                        peak.fetch_max(current, Ordering::Relaxed);
-                        sum.fetch_add(current, Ordering::Relaxed);
-                        count.fetch_add(1, Ordering::Relaxed);
-                    }
+                    sample(&mut cpu_first, &mut cpu_last);
                     if let Some(ref dir) = spill_dir {
                         let size = dir_size(dir);
                         spill_peak.fetch_max(size, Ordering::Relaxed);
                     }
                 }
+
+                // Final sample once stop is signalled, so memory and CPU are
+                // captured right up to the end of the run rather than as of the
+                // last full poll interval (which could undercount by up to
+                // POLL_INTERVAL).
+                sample(&mut cpu_first, &mut cpu_last);
             })
         };
 
@@ -151,36 +227,54 @@ impl CgroupMonitor {
             start_time: Instant::now(),
             start_memory,
             start_cpu,
+            root_pid,
             stop_flag,
             peak_memory,
             memory_sum,
             peak_spill,
             sample_count,
+            cpu_user_usec,
+            cpu_sys_usec,
+            proc_ok,
             poll_handle,
         }
     }
 
-    /// Stop monitoring and compute delta statistics.
+    /// Stop monitoring and compute statistics.
     pub async fn finish(self) -> ResourceStats {
         let wall_time = self.start_time.elapsed();
 
         self.stop_flag.store(true, Ordering::Relaxed);
         let _ = self.poll_handle.await;
 
-        let end_memory = read_memory_current().unwrap_or(0);
-        let end_cpu = read_cpu_stat();
-
+        // The poll loop's final sample already updated peak/sum/count up to the
+        // end of the run, so don't take (and double-count) another into them.
+        let proc_ok = self.proc_ok.load(Ordering::Relaxed);
+        let end_memory = if proc_ok {
+            sample_memory(self.root_pid).unwrap_or(0)
+        } else {
+            read_memory_current().unwrap_or(0)
+        };
         let peak = self.peak_memory.load(Ordering::Relaxed).max(end_memory);
-        let total_sum = self.memory_sum.load(Ordering::Relaxed) + end_memory;
-        let total_count = self.sample_count.load(Ordering::Relaxed) + 1;
+        let total_sum = self.memory_sum.load(Ordering::Relaxed);
+        let total_count = self.sample_count.load(Ordering::Relaxed);
         let avg = total_sum.checked_div(total_count).unwrap_or(0);
 
-        let (cpu_user, cpu_sys) = match (self.start_cpu, end_cpu) {
-            (Some(start), Some(end)) => (
-                end.user_usec.saturating_sub(start.user_usec),
-                end.system_usec.saturating_sub(start.system_usec),
-            ),
-            _ => (0, 0),
+        // CPU: per-process subtree accumulation when `/proc` sampling worked (so
+        // the compile is excluded), otherwise the pod-wide cgroup delta.
+        let (cpu_user, cpu_sys) = if proc_ok {
+            (
+                self.cpu_user_usec.load(Ordering::Relaxed),
+                self.cpu_sys_usec.load(Ordering::Relaxed),
+            )
+        } else {
+            match (self.start_cpu, read_cpu_stat()) {
+                (Some(start), Some(end)) => (
+                    end.user_usec.saturating_sub(start.user_usec),
+                    end.system_usec.saturating_sub(start.system_usec),
+                ),
+                _ => (0, 0),
+            }
         };
 
         let peak_spill = self.peak_spill.load(Ordering::Relaxed);
@@ -197,6 +291,165 @@ impl CgroupMonitor {
             sample_count: total_count as u32,
         }
     }
+}
+
+/// Clock ticks per second (`USER_HZ`), read once from `sysconf(_SC_CLK_TCK)`.
+/// This is 100 on most Linux configurations but is not guaranteed, so we query
+/// it rather than hard-coding it. Falls back to 100 if the query fails.
+fn clk_tck() -> u64 {
+    use std::sync::OnceLock;
+    static TCK: OnceLock<u64> = OnceLock::new();
+    *TCK.get_or_init(|| {
+        let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if v > 0 {
+            v as u64
+        } else {
+            100
+        }
+    })
+}
+
+/// Convert cumulative clock ticks (`USER_HZ`) from `/proc/<pid>/stat` to
+/// microseconds, using the actual `_SC_CLK_TCK` value.
+fn ticks_to_usec(ticks: u64) -> u64 {
+    ticks.saturating_mul(1_000_000) / clk_tck()
+}
+
+// --- per-process sampling ---
+
+/// Compiler / build-tool process names (as they appear in `/proc/<pid>/status`
+/// `Name:` / `/proc/<pid>/stat` comm, truncated to 15 chars) whose usage should
+/// NOT be attributed to the benchmark. A `cargo bench` step spawns these as
+/// children of the monitored command; counting them would report compiler
+/// memory and CPU as benchmark memory and CPU.
+const BUILD_TOOL_NAMES: &[&str] = &[
+    "cargo", "rustc", "sccache", "cc", "cc1", "cc1plus", "gcc", "g++", "c++", "clang", "clang++",
+    "ld", "ld.lld", "lld", "ld.gold", "ld.bfd", "ld.mold", "mold", "collect2", "as", "ar",
+    "rustdoc",
+];
+
+fn is_build_tool(name: &str) -> bool {
+    BUILD_TOOL_NAMES.contains(&name)
+        || name.starts_with("build-script")
+        || name.starts_with("build_script")
+}
+
+/// Per-process cumulative CPU sample: `(pid, utime_ticks, stime_ticks)`.
+type ProcCpu = (u32, u64, u64);
+
+/// One subtree snapshot: `(total VmRSS bytes, per-process CPU)`.
+type SubtreeSample = (u64, Vec<ProcCpu>);
+
+/// Sample current memory: the benchmark process subtree RSS when `root_pid` is
+/// known and `/proc` is readable, otherwise the pod-wide cgroup figure.
+fn sample_memory(root_pid: Option<u32>) -> Option<u64> {
+    match root_pid {
+        Some(pid) => proc_tree_sample(Some(pid))
+            .map(|(rss, _)| rss)
+            .or_else(read_memory_current),
+        None => read_memory_current(),
+    }
+}
+
+/// One snapshot of the process subtree rooted at `root_pid`, excluding
+/// compiler/build-tool processes:
+///   - total `VmRSS` in bytes
+///   - per-process cumulative CPU `(pid, utime_ticks, stime_ticks)`
+///
+/// Returns `None` if `/proc` can't be read at all (e.g. macOS), or if
+/// `root_pid` is `None`. Returns `Some((0, []))` if the subtree is already gone.
+fn proc_tree_sample(root_pid: Option<u32>) -> Option<SubtreeSample> {
+    let root_pid = root_pid?;
+    let entries = std::fs::read_dir("/proc").ok()?;
+
+    // pid -> (ppid, name, rss_bytes, utime_ticks, stime_ticks)
+    let mut procs: std::collections::HashMap<u32, ProcInfo> = std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue, // non-numeric /proc entry
+        };
+        if let Some(info) = read_proc_info(pid) {
+            procs.insert(pid, info);
+        }
+    }
+
+    // children index
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for (&pid, info) in &procs {
+        children.entry(info.ppid).or_default().push(pid);
+    }
+
+    // BFS from root, collecting non-build-tool processes.
+    let mut rss_total: u64 = 0;
+    let mut cpus: Vec<(u32, u64, u64)> = Vec::new();
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        if let Some(info) = procs.get(&pid) {
+            if !is_build_tool(&info.name) {
+                rss_total += info.rss_bytes;
+                cpus.push((pid, info.utime_ticks, info.stime_ticks));
+            }
+        }
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    Some((rss_total, cpus))
+}
+
+struct ProcInfo {
+    ppid: u32,
+    name: String,
+    rss_bytes: u64,
+    utime_ticks: u64,
+    stime_ticks: u64,
+}
+
+/// Read process info from `/proc/<pid>/status` (ppid, name, VmRSS) and
+/// `/proc/<pid>/stat` (utime, stime).
+fn read_proc_info(pid: u32) -> Option<ProcInfo> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut ppid = None;
+    let mut name = None;
+    let mut rss_kb = 0u64;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("Name:") {
+            name = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("PPid:") {
+            ppid = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("VmRSS:") {
+            // e.g. "VmRSS:   123456 kB"
+            rss_kb = v
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+
+    let (utime_ticks, stime_ticks) = read_proc_cpu_ticks(pid).unwrap_or((0, 0));
+
+    Some(ProcInfo {
+        ppid: ppid?,
+        name: name?,
+        rss_bytes: rss_kb * 1024,
+        utime_ticks,
+        stime_ticks,
+    })
+}
+
+/// Parse cumulative `(utime, stime)` clock ticks from `/proc/<pid>/stat`.
+/// The comm field (field 2) can contain spaces and parentheses, so split on the
+/// last `)`; the remaining whitespace-separated fields start at field 3
+/// (`state`), making utime field 14 → index 11 and stime field 15 → index 12.
+fn read_proc_cpu_ticks(pid: u32) -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let utime = fields.get(11).and_then(|s| s.parse().ok())?;
+    let stime = fields.get(12).and_then(|s| s.parse().ok())?;
+    Some((utime, stime))
 }
 
 // --- cgroup v2 file readers ---
@@ -367,10 +620,77 @@ throttled_usec 0
 
     #[tokio::test]
     async fn test_monitor_returns_stats() {
-        let monitor = CgroupMonitor::start(None);
+        let monitor = CgroupMonitor::start(None, None);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let stats = monitor.finish().await;
         assert!(stats.wall_time >= Duration::from_millis(50));
-        assert!(stats.sample_count >= 2);
+        // The start baseline always counts as one sample; additional samples
+        // require a readable data source (cgroup or `/proc`), which is absent on
+        // e.g. local macOS development.
+        assert!(stats.sample_count >= 1);
+    }
+
+    // Multi-threaded runtime so the background poll task can sample while this
+    // task burns CPU; CPU is a delta between samples, so the process must be
+    // sampled at least twice (poll interval is 1s) — hence the >2s spin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_monitor_self_subtree_has_cpu_and_mem() {
+        // Monitor our own process subtree; we should observe non-zero RSS and,
+        // after doing some work, non-zero CPU — proving the /proc sampler runs.
+        let pid = std::process::id();
+        let monitor = CgroupMonitor::start(Some(pid), None);
+        // Burn CPU so the process's utime advances across poll samples.
+        let mut x: u64 = 0;
+        let spin_until = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < spin_until {
+            x = x.wrapping_add(1);
+            std::hint::black_box(x);
+        }
+        let stats = monitor.finish().await;
+        // On non-/proc platforms (macOS) these are zero; only assert there.
+        if std::path::Path::new("/proc/self/status").exists() {
+            assert!(stats.peak_memory_bytes > 0, "expected non-zero RSS");
+            // CPU needs >= 2 poll samples for a non-zero delta (the first only
+            // establishes the per-process baseline). sample_count = start + polls
+            // + end, so >= 3 means at least two polls landed.
+            if stats.sample_count >= 3 {
+                assert!(
+                    stats.cpu_user_usec > 0,
+                    "expected non-zero user CPU for the spinning process"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_build_tool() {
+        assert!(is_build_tool("rustc"));
+        assert!(is_build_tool("cargo"));
+        assert!(is_build_tool("sccache"));
+        assert!(is_build_tool("ld.lld"));
+        assert!(is_build_tool("build-script-build"));
+        assert!(is_build_tool("build_script_build"));
+        assert!(!is_build_tool("dfbench"));
+        assert!(!is_build_tool("sql-712c5e60f8")); // criterion bench binary
+    }
+
+    #[test]
+    fn test_ticks_to_usec() {
+        let tck = clk_tck();
+        assert!(tck > 0);
+        assert_eq!(ticks_to_usec(0), 0);
+        // `clk_tck` ticks = exactly one second, whatever USER_HZ happens to be.
+        assert_eq!(ticks_to_usec(tck), 1_000_000);
+    }
+
+    #[test]
+    fn test_read_proc_cpu_ticks_self() {
+        // Only meaningful on Linux; skip elsewhere.
+        if std::path::Path::new("/proc/self/stat").exists() {
+            let pid = std::process::id();
+            let (u, s) = read_proc_cpu_ticks(pid).expect("read self cpu ticks");
+            // Cumulative ticks are monotonic and fit in u64; just sanity bound.
+            assert!(u < u64::MAX && s < u64::MAX);
+        }
     }
 }
