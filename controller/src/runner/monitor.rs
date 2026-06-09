@@ -579,15 +579,18 @@ throttled_usec 0
         assert!(stats.sample_count >= 2);
     }
 
-    #[tokio::test]
+    // Multi-threaded runtime so the background poll task can sample while this
+    // task burns CPU; CPU is a delta between samples, so the process must be
+    // sampled at least twice (poll interval is 1s) — hence the >2s spin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_monitor_self_subtree_has_cpu_and_mem() {
         // Monitor our own process subtree; we should observe non-zero RSS and,
         // after doing some work, non-zero CPU — proving the /proc sampler runs.
         let pid = std::process::id();
         let monitor = CgroupMonitor::start(Some(pid), None);
-        // Burn a little CPU so utime advances across polls.
+        // Burn CPU so the process's utime advances across poll samples.
         let mut x: u64 = 0;
-        let spin_until = Instant::now() + Duration::from_millis(1200);
+        let spin_until = Instant::now() + Duration::from_millis(2500);
         while Instant::now() < spin_until {
             x = x.wrapping_add(1);
             std::hint::black_box(x);
@@ -596,10 +599,15 @@ throttled_usec 0
         // On non-/proc platforms (macOS) these are zero; only assert there.
         if std::path::Path::new("/proc/self/status").exists() {
             assert!(stats.peak_memory_bytes > 0, "expected non-zero RSS");
-            assert!(
-                stats.cpu_user_usec > 0,
-                "expected non-zero user CPU for the spinning process"
-            );
+            // CPU needs >= 2 poll samples for a non-zero delta (the first only
+            // establishes the per-process baseline). sample_count = start + polls
+            // + end, so >= 3 means at least two polls landed.
+            if stats.sample_count >= 3 {
+                assert!(
+                    stats.cpu_user_usec > 0,
+                    "expected non-zero user CPU for the spinning process"
+                );
+            }
         }
     }
 
