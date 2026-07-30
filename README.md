@@ -129,6 +129,37 @@ changed:
 
 Per-side env vars override shared env vars when both set the same key.
 
+### Peak memory pool reservation
+
+DataFusion records the high-water mark of `MemoryPool::reserved()` per query and
+writes it to the results JSON as `pool_peak_bytes`
+([apache/datafusion#23985](https://github.com/apache/datafusion/pull/23985)).
+The result comment renders it in a **Memory Pool Peaks** section: a per-query
+base-vs-changed table, plus the largest peak in each run paired against the peak
+RSS the [resource monitor](controller/src/runner/monitor.rs) sampled for the same
+invocation.
+
+DataFusion installs the recording pool only when a memory limit is configured, so
+the section appears only if you ask for one:
+
+```yaml
+run benchmark tpch
+env:
+  DATAFUSION_RUNTIME_MEMORY_LIMIT: 8G
+```
+
+Without a limit nothing is recorded, and the section is omitted rather than
+reported as zero. The same applies per side — comparing against a baseline that
+predates #23985 renders that column as `n/a` with a note saying why.
+
+This is measurement only. Nothing asserts a relationship between what the pool
+accounts for and what the process actually allocates; operators deliberately
+leave in-flight batches untracked, so the gap between the two is expected and is
+not gated on.
+
+Only benchmarks that go through `bench.sh`/`dfbench` produce a results JSON;
+Criterion targets have no equivalent and are absent from the section.
+
 ### View the queue
 
 View the queue:
@@ -197,6 +228,9 @@ controller/                Rust controller crate
     db.rs                  SQLite queries (jobs, seen comments, scan state)
     benchmarks.rs          Trigger parsing (no allowlist — any name is accepted)
   migrations/              SQLite schema
+    runner/
+      monitor.rs           Peak/avg RSS, CPU and spill sampling per benchmark invocation
+      pool_peak.rs         Per-query `pool_peak_bytes` from the results JSON
 runner/                    Benchmark runner container (builds project, runs benchmarks, posts results)
 queries/                   SQL query files for ClickBench
 scripts/                   Legacy benchmark scripts (reference)

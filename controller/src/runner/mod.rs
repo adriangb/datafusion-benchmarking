@@ -4,5 +4,6 @@ pub mod config;
 pub mod controller_client;
 pub mod git;
 pub mod monitor;
+pub mod pool_peak;
 pub mod poster;
 pub mod shell;
