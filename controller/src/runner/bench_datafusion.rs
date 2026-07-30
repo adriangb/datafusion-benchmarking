@@ -15,6 +15,10 @@
 //! by the benchmark name: `results/<side>/*.json` is diffed with
 //! `bench.sh compare_detail`, and `target/criterion` baselines are diffed with
 //! `critcmp`. A run mixing both families emits both sections.
+//!
+//! `compare_detail` reports wall time only, so the same `results/<side>/*.json`
+//! are additionally read here for `pool_peak_bytes` — see
+//! [`pool_peak`](super::pool_peak).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,7 @@ use crate::github;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
+use crate::runner::pool_peak::{self, BenchPeaks};
 use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
 
@@ -170,6 +175,9 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     // Run each benchmark
     let mut base_stats_list: Vec<(String, ResourceStats)> = Vec::new();
     let mut branch_stats_list: Vec<(String, ResourceStats)> = Vec::new();
+    // Per-query pool peaks, attributed to the invocation that wrote them.
+    let mut base_peaks: Vec<BenchPeaks> = Vec::new();
+    let mut branch_peaks: Vec<BenchPeaks> = Vec::new();
 
     let bench_dir_str = bench_benchmarks.to_string_lossy().to_string();
 
@@ -180,6 +188,9 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     // to a predictable location per side, regardless of branch vs detached HEAD.
     let base_results_name = "HEAD".to_string();
     let bench_branch_name = git::sanitize_branch_name(&branch_name);
+
+    let base_results_dir = bench_benchmarks.join("results").join(&base_results_name);
+    let branch_results_dir = bench_benchmarks.join("results").join(&bench_branch_name);
 
     // Track whether any Criterion baselines were produced per side, so the
     // comparison can pick `critcmp HEAD <branch>` vs a branch-only `critcmp`.
@@ -233,6 +244,9 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         info!("** Running {bench} baseline **");
         let base_spill_dir = PathBuf::from(format!("/workspace/spill-base-{bench}"));
         let _ = tokio::fs::create_dir_all(&base_spill_dir).await;
+        // The results file name doesn't follow the benchmark name, so bracket
+        // the run and attribute whatever JSON appears to this invocation.
+        let base_before = pool_peak::snapshot_json_files(&base_results_dir).await;
         let base_stats = run_shell_side(
             bench,
             &base_dir,
@@ -244,11 +258,13 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         .await
         .with_context(|| format!("run {bench} (base)"))?;
         let _ = tokio::fs::remove_dir_all(&base_spill_dir).await;
+        base_peaks.extend(pool_peak::collect_new(&base_results_dir, &base_before, bench).await);
         base_stats_list.push((bench.clone(), base_stats));
 
         info!("** Running {bench} branch **");
         let branch_spill_dir = PathBuf::from(format!("/workspace/spill-branch-{bench}"));
         let _ = tokio::fs::create_dir_all(&branch_spill_dir).await;
+        let branch_before = pool_peak::snapshot_json_files(&branch_results_dir).await;
         let branch_stats = run_shell_side(
             bench,
             &branch_dir,
@@ -260,6 +276,8 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         .await
         .with_context(|| format!("run {bench} (branch)"))?;
         let _ = tokio::fs::remove_dir_all(&branch_spill_dir).await;
+        branch_peaks
+            .extend(pool_peak::collect_new(&branch_results_dir, &branch_before, bench).await);
         branch_stats_list.push((bench.clone(), branch_stats));
     }
 
@@ -311,10 +329,19 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     }
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
+    let pool_section = pool_peak::format_pool_peak_section(
+        &baseline_label,
+        changed_display,
+        &base_peaks,
+        &branch_peaks,
+        &base_stats_list,
+        &branch_stats_list,
+    );
     let result_body = format_result_comment(
         &config.comment_url,
         &report,
         &resource_section,
+        &pool_section,
         &instance_type,
         &pod_resources,
         &lscpu,
@@ -694,15 +721,31 @@ fn format_resource_section(
 }
 
 /// Format the result comment body.
+///
+/// `pool_section` is empty whenever no side recorded a `pool_peak_bytes` — the
+/// default, since runs set no memory limit unless the trigger comment asks for
+/// one. Its `<details>` block is then omitted entirely, leaving the comment as
+/// it was before the section existed.
+#[allow(clippy::too_many_arguments)]
 fn format_result_comment(
     comment_url: &str,
     report: &str,
     resource_section: &str,
+    pool_section: &str,
     instance_type: &str,
     pod_resources: &str,
     lscpu: &str,
     footer: &str,
 ) -> String {
+    let pool_block = if pool_section.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details><summary>Memory Pool Peaks</summary>\n\n\
+             {pool_section}\
+             </details>\n\n"
+        )
+    };
     format!(
         "\u{1f916} Benchmark completed (GKE) | [trigger]({comment_url})\n\n\
          **Instance:** `{instance_type}` ({pod_resources})\n\n\
@@ -718,6 +761,7 @@ fn format_result_comment(
          ```\n\n\
          </p>\n\
          </details>\n\n\
+         {pool_block}\
          <details><summary>Resource Usage</summary>\n\n\
          {resource_section}\
          </details>\n\
@@ -735,6 +779,7 @@ mod tests {
             "https://example.com/comment",
             "test report\n",
             "resources\n",
+            "",
             "c4a-standard-48",
             "12 vCPU / 65 GiB",
             "lscpu output",
@@ -749,6 +794,28 @@ mod tests {
         assert!(comment.contains("c4a-standard-48"));
         assert!(comment.contains("12 vCPU / 65 GiB"));
         assert!(comment.contains("lscpu output"));
+        // Nothing recorded a pool peak — the section is absent, not empty.
+        assert!(!comment.contains("Memory Pool Peaks"));
+    }
+
+    #[test]
+    fn result_comment_includes_pool_section_when_recorded() {
+        let comment = format_result_comment(
+            "https://example.com/comment",
+            "test report\n",
+            "resources\n",
+            "pool peaks table\n",
+            "c4a-standard-48",
+            "12 vCPU / 65 GiB",
+            "lscpu output",
+            "",
+        );
+        assert!(comment.contains("<details><summary>Memory Pool Peaks</summary>"));
+        assert!(comment.contains("pool peaks table"));
+        // Sits between the wall-time report and the run-wide resource sampling.
+        let pool = comment.find("Memory Pool Peaks").unwrap();
+        assert!(pool > comment.find("test report").unwrap());
+        assert!(pool < comment.find("Resource Usage").unwrap());
     }
 
     #[test]
