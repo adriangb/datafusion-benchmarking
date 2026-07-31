@@ -291,19 +291,49 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     }
 
     // Compare and post results, driven by the artifacts that were produced:
-    //   - results/*.json (dfbench suites) → `bench.sh compare_detail`
+    //   - results/*.json (dfbench suites) → `bench.sh compare` + `compare_detail`
     //   - target/criterion baselines (Criterion targets + the bench.sh SQL
     //     harness) → `critcmp`
     let mut report = String::new();
 
     if any_shell && results_have_json(&bench_benchmarks, &base_results_name).await {
+        // Two tables over the same results JSON, differing only in the statistic
+        // `compare.py` reduces each query's iterations to:
+        //
+        //   `compare`        → min  (fastest iteration)
+        //   `compare_detail` → mean (and renders min/mean±stddev/max)
+        //
+        // The verdict table is the min-based one. An A/A run — identical SHAs on
+        // both sides, so every reported difference is noise — put the mean-based
+        // per-query error at 1.29% median / 4.31% worst and the aggregate at
+        // -0.26%, against 0.55% / 3.52% and +0.00% for min:
+        // https://github.com/adriangb/datafusion/pull/15#issuecomment-5139405485
+        //
+        // Both sides run sequentially in one pod, so a slow iteration is usually
+        // the node interfering rather than the query; the mean folds that in and
+        // the min discards it. `compare_detail` still follows, because the spread
+        // it shows is what makes an unstable query legible as unstable instead of
+        // as a regression.
+        let summary = shell::run_command(
+            "./bench.sh",
+            &["compare", &base_results_name, &bench_branch_name],
+            &bench_benchmarks,
+        )
+        .await
+        .context("bench.sh compare")?;
+        report.push_str(&summary);
+
         let detail = shell::run_command(
             "./bench.sh",
             &["compare_detail", &base_results_name, &bench_branch_name],
             &bench_benchmarks,
         )
         .await
-        .context("bench.sh compare")?;
+        .context("bench.sh compare_detail")?;
+        if !report.is_empty() {
+            report.push('\n');
+        }
+        report.push_str("Distribution per query (min / mean ±stddev / max):\n\n");
         report.push_str(&detail);
     }
 
