@@ -11,6 +11,7 @@ use crate::runner::git;
 use crate::runner::monitor;
 use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
+use crate::runner::trigger;
 
 /// Run an arrow-rs criterion benchmark comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
@@ -75,6 +76,15 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     } else {
         format!("{} (merge-base)", &base_sha[..7.min(base_sha.len())])
     };
+    let comparison = trigger::Comparison {
+        repo: &config.repo,
+        changed_display,
+        changed_sha: &changed_sha,
+        baseline_label: &baseline_label,
+        base_sha: &base_sha,
+    };
+    let config_block = trigger::config_block(config, bench_name);
+
     let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let running_body = format!(
         "\u{1f916} Arrow criterion benchmark running (GKE) | [trigger]({})\n\
@@ -84,14 +94,12 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
          {lscpu}\n\
          ```\n\n\
          </details>\n\n\
-         Comparing {changed_display} ({changed_sha}) to {baseline_label} \
-         [diff](https://github.com/{repo}/compare/{base_sha}..{changed_sha})\n\
-         BENCH_NAME={bench_name}\n\
+         {comparison}\n\n\
+         {config_block}\
          BENCH_COMMAND={bench_command_display}\n\
-         BENCH_FILTER={bench_filter}\n\
          Results will be posted here when complete{footer}",
         config.comment_url,
-        repo = config.repo,
+        comparison = comparison.line(),
     );
     let pr_number = config.pr_number()?;
     poster
@@ -193,6 +201,8 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         );
         format_result_comment(
             &config.comment_url,
+            &comparison.line(),
+            &config_block,
             &report,
             &resource_section,
             &instance_type,
@@ -209,6 +219,8 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             monitor::format_resource_comment("branch", &branch_stats).to_string();
         format_branch_only_result_comment(
             &config.comment_url,
+            &comparison.line(),
+            &config_block,
             &report,
             &resource_section,
             &instance_type,
@@ -253,8 +265,14 @@ async fn copy_criterion_baselines(base_dir: &Path, branch_dir: &Path) {
 }
 
 /// Format the result comment body.
+///
+/// `comparison` and `config_block` restate what was run, so the result reads on
+/// its own rather than only linking back to the trigger comment.
+#[allow(clippy::too_many_arguments)]
 fn format_result_comment(
     comment_url: &str,
+    comparison: &str,
+    config_block: &str,
     report: &str,
     resource_section: &str,
     instance_type: &str,
@@ -265,6 +283,8 @@ fn format_result_comment(
     format!(
         "\u{1f916} Arrow criterion benchmark completed (GKE) | [trigger]({comment_url})\n\n\
          **Instance:** `{instance_type}` ({pod_resources})\n\n\
+         {comparison}\n\n\
+         {config_block}\
          <details><summary>CPU Details (lscpu)</summary>\n\n\
          ```\n\
          {lscpu}\n\
@@ -285,8 +305,11 @@ fn format_result_comment(
 }
 
 /// Format the result comment body for branch-only runs (no baseline comparison).
+#[allow(clippy::too_many_arguments)]
 fn format_branch_only_result_comment(
     comment_url: &str,
+    comparison: &str,
+    config_block: &str,
     report: &str,
     resource_section: &str,
     instance_type: &str,
@@ -297,6 +320,8 @@ fn format_branch_only_result_comment(
     format!(
         "\u{1f916} Arrow criterion benchmark completed (GKE) | [trigger]({comment_url})\n\n\
          **Instance:** `{instance_type}` ({pod_resources})\n\n\
+         {comparison}\n\n\
+         {config_block}\
          <details><summary>CPU Details (lscpu)</summary>\n\n\
          ```\n\
          {lscpu}\n\
@@ -340,10 +365,17 @@ mod tests {
         );
     }
 
+    /// Stand-ins for the two "what was run" sections the runner passes in.
+    const COMPARISON: &str =
+        "Comparing my-branch (aaa) to bbb (merge-base) [diff](https://example.com/diff)";
+    const CONFIG_BLOCK: &str = "<details><summary>Run configuration</summary>\n\n```yaml\nrun benchmark concatenate_kernel\n```\n\n</details>\n\n";
+
     #[test]
     fn result_comment_format() {
         let comment = format_result_comment(
             "https://example.com/comment",
+            COMPARISON,
+            CONFIG_BLOCK,
             "test report\n",
             "resources\n",
             "c4a-standard-48",
@@ -358,12 +390,16 @@ mod tests {
         assert!(comment.contains("c4a-standard-48"));
         assert!(comment.contains("12 vCPU / 65 GiB"));
         assert!(comment.contains("lscpu output"));
+        assert!(comment.contains("Comparing my-branch (aaa)"));
+        assert!(comment.contains("run benchmark concatenate_kernel"));
     }
 
     #[test]
     fn branch_only_result_comment_format() {
         let comment = format_branch_only_result_comment(
             "https://example.com/comment",
+            COMPARISON,
+            CONFIG_BLOCK,
             "branch report\n",
             "branch resources\n",
             "c4a-standard-48",
@@ -372,6 +408,8 @@ mod tests {
             "",
         );
         assert!(comment.contains("Arrow criterion benchmark completed"));
+        assert!(comment.contains("Comparing my-branch (aaa)"));
+        assert!(comment.contains("run benchmark concatenate_kernel"));
         assert!(comment.contains("New benchmark — branch-only results"));
         assert!(comment.contains("[trigger](https://example.com/comment)"));
         assert!(comment.contains("branch report"));

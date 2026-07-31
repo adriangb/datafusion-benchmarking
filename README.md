@@ -129,6 +129,33 @@ changed:
 
 Per-side env vars override shared env vars when both set the same key.
 
+### What ran: the Run configuration block
+
+Every comment the runner posts — running, completed, and failed — states what it
+is benchmarking: a `Comparing <changed> (<sha>) to <baseline> [diff]` line, and a
+collapsed **Run configuration** block holding the refs and env vars in the same
+YAML the trigger accepts.
+
+It is re-rendered from the job rather than quoted from the trigger comment,
+because the two differ: one `run benchmark tpch clickbench_1` fans out into one
+job (and one comment) per name, and a bare `run benchmarks` expands to the repo's
+default suite. The block shows what *this* run did, so pasting it back into a PR
+comment reproduces that run on its own.
+
+```yaml
+run benchmark tpch
+env:
+  CARGO_BUILD_JOBS: "1"
+baseline:
+  ref: "v45.0.0"
+changed:
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: "2G"
+```
+
+Sections with nothing to report are omitted, so an unconfigured run renders as
+just its trigger line.
+
 ### Peak memory pool reservation
 
 DataFusion records the high-water mark of `MemoryPool::reserved()` per query and

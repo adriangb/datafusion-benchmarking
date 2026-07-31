@@ -3,7 +3,8 @@
 //! The controller passes these env vars to PR-triggered runner pods (see
 //! `job_manager.rs`): `PR_URL`, `COMMENT_ID`, `BENCHMARKS`, `BENCH_TYPE`,
 //! `BENCH_NAME`, `BENCH_FILTER`, `REPO`, `JOB_ID`, `RUNNER_TOKEN`,
-//! `CONTROLLER_URL`, `RUNNER_REPO_URL`. The scheduled main-tracking
+//! `CONTROLLER_URL`, `RUNNER_REPO_URL`, `SHARED_ENV_VARS`,
+//! `BASELINE_ENV_VARS`, `CHANGED_ENV_VARS`. The scheduled main-tracking
 //! workflow instead supplies `GITHUB_TOKEN` directly (no PR author to
 //! distrust).
 
@@ -67,6 +68,10 @@ pub struct RunnerConfig {
     pub poster_mode: PosterMode,
     pub sccache_gcs_bucket: Option<String>,
     pub data_cache_bucket: Option<String>,
+    /// Env vars from the trigger comment's shared `env:` block. These are
+    /// already set on the pod (so they reach the build too); the map is kept
+    /// only so comments can report what was requested.
+    pub shared_env_vars: HashMap<String, String>,
     pub baseline_env_vars: HashMap<String, String>,
     pub changed_env_vars: HashMap<String, String>,
     pub baseline_ref: Option<String>,
@@ -83,6 +88,10 @@ impl RunnerConfig {
         let comment_url = format!("{pr_url}#issuecomment-{comment_id}");
         let bench_type_str = env_required("BENCH_TYPE")?;
 
+        let shared_env_vars: HashMap<String, String> = std::env::var("SHARED_ENV_VARS")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         let baseline_env_vars: HashMap<String, String> = std::env::var("BASELINE_ENV_VARS")
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -104,6 +113,7 @@ impl RunnerConfig {
             poster_mode: parse_poster_mode()?,
             sccache_gcs_bucket: std::env::var("SCCACHE_GCS_BUCKET").ok(),
             data_cache_bucket: std::env::var("DATA_CACHE_BUCKET").ok(),
+            shared_env_vars,
             baseline_env_vars,
             changed_env_vars,
             baseline_ref: std::env::var("BASELINE_REF").ok(),

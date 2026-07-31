@@ -7,3 +7,4 @@ pub mod monitor;
 pub mod pool_peak;
 pub mod poster;
 pub mod shell;
+pub mod trigger;
