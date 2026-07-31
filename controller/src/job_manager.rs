@@ -414,6 +414,14 @@ async fn create_k8s_job(
         env.push(env_var(k, v));
     }
 
+    // Also pass the shared block as a JSON map. The pod already has these set
+    // individually (above); the map lets the runner report them in PR comments
+    // without having to guess which of its env vars came from the trigger.
+    env.push(env_var(
+        "SHARED_ENV_VARS",
+        serde_json::to_string(&shared_env_vars)?,
+    ));
+
     // Pass per-side env vars as JSON maps for the runner to apply
     env.push(env_var("BASELINE_ENV_VARS", &job.baseline_env_vars));
     env.push(env_var("CHANGED_ENV_VARS", &job.changed_env_vars));

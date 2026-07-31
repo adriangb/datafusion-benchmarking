@@ -33,6 +33,7 @@ use crate::runner::monitor::{self, ResourceStats};
 use crate::runner::pool_peak::{self, BenchPeaks};
 use crate::runner::poster::CommentPoster;
 use crate::runner::shell;
+use crate::runner::trigger;
 
 /// Run DataFusion benchmarks comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
@@ -121,6 +122,15 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         format!("{} (merge-base)", &base_sha[..7.min(base_sha.len())])
     };
 
+    let comparison = trigger::Comparison {
+        repo: &config.repo,
+        changed_display,
+        changed_sha: &changed_sha,
+        baseline_label: &baseline_label,
+        base_sha: &base_sha,
+    };
+    let config_block = trigger::config_block(config, benchmarks);
+
     let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let running_body = format!(
         "\u{1f916} Benchmark running (GKE) | [trigger]({})\n\
@@ -130,12 +140,11 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
          {lscpu}\n\
          ```\n\n\
          </details>\n\n\
-         Comparing {changed_display} ({changed_sha}) to {baseline_label} \
-         [diff](https://github.com/{repo}/compare/{base_sha}..{changed_sha}) \
-         using: {benchmarks}\n\
+         {comparison}\n\n\
+         {config_block}\
          Results will be posted here when complete{footer}",
         config.comment_url,
-        repo = config.repo,
+        comparison = comparison.line(),
     );
     poster
         .post_comment(&config.repo, pr_number, &running_body)
@@ -339,6 +348,8 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     );
     let result_body = format_result_comment(
         &config.comment_url,
+        &comparison.line(),
+        &config_block,
         &report,
         &resource_section,
         &pool_section,
@@ -722,6 +733,10 @@ fn format_resource_section(
 
 /// Format the result comment body.
 ///
+/// `comparison` and `config_block` restate what was run — the same two lines
+/// the "running" comment opened with — so the result stands on its own instead
+/// of only linking back to the trigger.
+///
 /// `pool_section` is empty whenever no side recorded a `pool_peak_bytes` — the
 /// default, since runs set no memory limit unless the trigger comment asks for
 /// one. Its `<details>` block is then omitted entirely, leaving the comment as
@@ -729,6 +744,8 @@ fn format_resource_section(
 #[allow(clippy::too_many_arguments)]
 fn format_result_comment(
     comment_url: &str,
+    comparison: &str,
+    config_block: &str,
     report: &str,
     resource_section: &str,
     pool_section: &str,
@@ -749,6 +766,8 @@ fn format_result_comment(
     format!(
         "\u{1f916} Benchmark completed (GKE) | [trigger]({comment_url})\n\n\
          **Instance:** `{instance_type}` ({pod_resources})\n\n\
+         {comparison}\n\n\
+         {config_block}\
          <details><summary>CPU Details (lscpu)</summary>\n\n\
          ```\n\
          {lscpu}\n\
@@ -777,6 +796,8 @@ mod tests {
     fn result_comment_format() {
         let comment = format_result_comment(
             "https://example.com/comment",
+            "Comparing my-branch (aaa) to bbb (merge-base) [diff](https://example.com/diff)",
+            "<details><summary>Run configuration</summary>\n\n```yaml\nrun benchmark tpch\n```\n\n</details>\n\n",
             "test report\n",
             "resources\n",
             "",
@@ -799,9 +820,34 @@ mod tests {
     }
 
     #[test]
+    fn result_comment_restates_what_was_run() {
+        // A result comment should be readable without opening the trigger.
+        let comment = format_result_comment(
+            "https://example.com/comment",
+            "Comparing my-branch (aaa) to bbb (merge-base) [diff](https://example.com/diff)",
+            "<details><summary>Run configuration</summary>\n\n```yaml\nrun benchmark tpch\nbaseline:\n  ref: \"v45.0.0\"\n```\n\n</details>\n\n",
+            "test report\n",
+            "resources\n",
+            "",
+            "c4a-standard-48",
+            "12 vCPU / 65 GiB",
+            "lscpu output",
+            "",
+        );
+        assert!(comment.contains("Comparing my-branch (aaa) to bbb (merge-base)"));
+        assert!(comment.contains("<details><summary>Run configuration</summary>"));
+        assert!(comment.contains("run benchmark tpch"));
+        assert!(comment.contains("ref: \"v45.0.0\""));
+        // Stated up front, before the results themselves.
+        assert!(comment.find("Run configuration").unwrap() < comment.find("test report").unwrap());
+    }
+
+    #[test]
     fn result_comment_includes_pool_section_when_recorded() {
         let comment = format_result_comment(
             "https://example.com/comment",
+            "Comparing my-branch (aaa) to bbb (merge-base) [diff](https://example.com/diff)",
+            "",
             "test report\n",
             "resources\n",
             "pool peaks table\n",
