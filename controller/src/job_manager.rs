@@ -266,8 +266,9 @@ fn terminal_failure_comment_body(
     let k8s_detail = if k8s_message.is_empty() {
         String::new()
     } else {
+        let fence = markdown_code_fence(k8s_message);
         format!(
-            "\n\n<details><summary>Kubernetes message</summary>\n\n```\n{k8s_message}\n```\n\n</details>"
+            "\n\n<details><summary>Kubernetes message</summary>\n\n{fence}\n{k8s_message}\n{fence}\n\n</details>"
         )
     };
 
@@ -287,6 +288,12 @@ fn terminal_failure_comment_body(
              Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
         )
     }
+}
+
+/// Return a Markdown code fence that cannot be closed by `content`.
+fn markdown_code_fence(content: &str) -> String {
+    let longest_run = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat(3.max(longest_run + 1))
 }
 
 /// Shorthand for constructing a plain-value [`EnvVar`].
@@ -752,5 +759,18 @@ mod tests {
             body,
             "Benchmark for [this request](https://github.com/apache/datafusion/pull/42#issuecomment-123) hit the 7200s job deadline before finishing.\n\nBenchmarks requested: `tpch`"
         );
+    }
+
+    #[test]
+    fn terminal_failure_comment_uses_safe_fence_for_kubernetes_message() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "pod output:\n```\nuntrusted markdown\n```",
+        );
+
+        assert!(body.contains("````\npod output:\n```\nuntrusted markdown\n```\n````"));
     }
 }
