@@ -192,13 +192,10 @@ async fn reconcile_active(
                     db::update_job_status(pool, job.id, JobStatus::Failed, None, Some(&err_msg))
                         .await?;
 
-                    // When a Job hits `activeDeadlineSeconds`, K8s SIGKILLs the
-                    // runner pod before the runner's `post_error_comment` can
-                    // fire. The controller posts the notification here so the
-                    // PR doesn't go silent.
-                    if reason == "DeadlineExceeded" {
-                        post_deadline_exceeded_comment(config, gh, &job, message).await;
-                    }
+                    // A terminal K8s failure can kill the runner before it
+                    // posts its own error comment. Notify from this reliable
+                    // controller-owned lifecycle boundary instead.
+                    post_terminal_failure_comment(config, gh, &job, reason, message).await;
                 }
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -224,23 +221,48 @@ async fn reconcile_active(
     Ok(())
 }
 
-/// Post a PR comment when a benchmark Job hits `activeDeadlineSeconds`.
+/// Post a PR comment for a terminal Kubernetes Job failure.
 ///
-/// The runner's own `post_error_comment` can't fire in this case because the
-/// deadline SIGKILLs the pod. Failures to post are logged but not propagated —
-/// the DB is already marked failed, and repeatedly retrying would risk double
-/// comments.
-async fn post_deadline_exceeded_comment(
+/// The runner can be killed before its own error handler posts a comment.
+/// Failures to post are logged but not propagated: the DB is already marked
+/// failed, and retrying here could create duplicate comments.
+async fn post_terminal_failure_comment(
     config: &Config,
     gh: &GitHubClient,
     job: &BenchmarkJob,
+    reason: &str,
     k8s_message: &str,
 ) {
+    let body = terminal_failure_comment_body(
+        config.active_deadline_secs,
+        config.runner_repo_url.as_deref(),
+        job,
+        reason,
+        k8s_message,
+    );
+    if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &body).await {
+        warn!(
+            comment_id = job.comment_id,
+            error = %e,
+            reason,
+            "failed to post terminal failure comment"
+        );
+    }
+}
+
+/// Format the controller-owned notification for a terminal Kubernetes failure.
+fn terminal_failure_comment_body(
+    active_deadline_secs: i64,
+    runner_repo_url: Option<&str>,
+    job: &BenchmarkJob,
+    reason: &str,
+    k8s_message: &str,
+) -> String {
     let benchmarks = serde_json::from_str::<Vec<String>>(&job.benchmarks)
         .map(|v| v.join(", "))
         .unwrap_or_else(|_| job.benchmarks.clone());
     let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
-    let footer = github::issues_footer(config.runner_repo_url.as_deref());
+    let footer = github::issues_footer(runner_repo_url);
     let k8s_detail = if k8s_message.is_empty() {
         String::new()
     } else {
@@ -248,17 +270,22 @@ async fn post_deadline_exceeded_comment(
             "\n\n<details><summary>Kubernetes message</summary>\n\n```\n{k8s_message}\n```\n\n</details>"
         )
     };
-    let body = format!(
-        "Benchmark for [this request]({comment_url}) hit the {deadline}s job deadline before finishing.\n\n\
-         Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
-        deadline = config.active_deadline_secs,
-    );
-    if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &body).await {
-        warn!(
-            comment_id = job.comment_id,
-            error = %e,
-            "failed to post deadline-exceeded comment"
-        );
+
+    if reason == "DeadlineExceeded" {
+        format!(
+            "Benchmark for [this request]({comment_url}) hit the {active_deadline_secs}s job deadline before finishing.\n\n\
+             Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
+        )
+    } else {
+        let reason = if reason.is_empty() {
+            "an unspecified Kubernetes error"
+        } else {
+            reason
+        };
+        format!(
+            "Benchmark for [this request]({comment_url}) failed before finishing (Kubernetes reason: `{reason}`).\n\n\
+             Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
+        )
     }
 }
 
@@ -673,5 +700,57 @@ mod tests {
         // Very unlikely to repeat.
         let tok2 = generate_runner_token();
         assert_ne!(tok, tok2);
+    }
+
+    fn test_job() -> BenchmarkJob {
+        BenchmarkJob {
+            id: 1,
+            comment_id: 123,
+            repo: "apache/datafusion".to_string(),
+            pr_number: 42,
+            pr_url: "https://github.com/apache/datafusion/pull/42".to_string(),
+            login: "alice".to_string(),
+            benchmarks: r#"["tpch"]"#.to_string(),
+            env_vars: "{}".to_string(),
+            baseline_env_vars: "{}".to_string(),
+            changed_env_vars: "{}".to_string(),
+            baseline_ref: None,
+            changed_ref: None,
+            job_type: "standard".to_string(),
+            cpu_request: None,
+            memory_request: None,
+            cpu_arch: None,
+            k8s_job_name: Some("bench-c123-1".to_string()),
+            status: "running".to_string(),
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            runner_token: None,
+        }
+    }
+
+    #[test]
+    fn terminal_failure_comment_includes_non_deadline_reason_and_message() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "Pod runner exited with status 1",
+        );
+
+        assert!(body.contains("failed before finishing"));
+        assert!(body.contains("BackoffLimitExceeded"));
+        assert!(body.contains("Pod runner exited with status 1"));
+    }
+
+    #[test]
+    fn deadline_exceeded_comment_keeps_existing_text() {
+        let body = terminal_failure_comment_body(7200, None, &test_job(), "DeadlineExceeded", "");
+
+        assert_eq!(
+            body,
+            "Benchmark for [this request](https://github.com/apache/datafusion/pull/42#issuecomment-123) hit the 7200s job deadline before finishing.\n\nBenchmarks requested: `tpch`"
+        );
     }
 }
