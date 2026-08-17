@@ -7,7 +7,7 @@ use anyhow::Result;
 use tracing::{error, info};
 
 use benchmark_controller::github;
-use benchmark_controller::runner::config::{BenchType, RunnerConfig};
+use benchmark_controller::runner::config::{BenchType, PosterMode, RunnerConfig};
 use benchmark_controller::runner::poster::CommentPoster;
 use benchmark_controller::runner::{bench_arrow, bench_datafusion, shell, trigger};
 
@@ -48,12 +48,20 @@ async fn main() {
 
     if let Err(e) = run_benchmark(&config, &poster).await {
         error!(error = %e, "benchmark failed");
-        post_error_comment(&config, &poster).await;
+        if runner_posts_failure_comment(&config.poster_mode) {
+            post_error_comment(&config, &poster).await;
+        }
         std::process::exit(1);
     }
 
     // Log sccache stats if enabled
     shell::log_sccache_stats().await;
+}
+
+/// Proxy-mode runs are reconciled by the controller, which owns their
+/// terminal failure notification. Direct runs have no controller job record.
+fn runner_posts_failure_comment(poster_mode: &PosterMode) -> bool {
+    matches!(poster_mode, PosterMode::Direct { .. })
 }
 
 async fn run_benchmark(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
@@ -99,5 +107,30 @@ async fn post_error_comment(config: &RunnerConfig, poster: &CommentPoster) {
 
     if let Err(e) = poster.post_comment(&config.repo, pr_number, &body).await {
         error!(error = %e, "failed to post error comment");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_runners_leave_failure_comments_to_the_controller() {
+        let mode = PosterMode::Proxy {
+            controller_url: "http://controller".to_string(),
+            job_id: "1".to_string(),
+            token: "token".to_string(),
+        };
+
+        assert!(!runner_posts_failure_comment(&mode));
+    }
+
+    #[test]
+    fn direct_runners_post_their_own_failure_comments() {
+        let mode = PosterMode::Direct {
+            github_token: "token".to_string(),
+        };
+
+        assert!(runner_posts_failure_comment(&mode));
     }
 }
