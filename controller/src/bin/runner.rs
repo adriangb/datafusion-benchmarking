@@ -47,7 +47,10 @@ async fn main() {
     let poster = config.build_poster();
 
     if let Err(e) = run_benchmark(&config, &poster).await {
-        error!(error = %e, "benchmark failed");
+        // `{:#}` walks the context chain. The outermost context names only the
+        // step ("run multi_group_by (branch, criterion)"); the command's own
+        // stderr, which says what actually went wrong, is further down it.
+        error!(error = %format!("{e:#}"), "benchmark failed");
         if runner_posts_failure_comment(&config.poster_mode) {
             post_error_comment(&config, &poster).await;
         }

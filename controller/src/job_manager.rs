@@ -9,12 +9,12 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, EnvVar, EnvVarSource, EphemeralVolumeSource,
-    PersistentVolumeClaimTemplate, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
-    SecurityContext, Toleration, Volume, VolumeMount,
+    PersistentVolumeClaimTemplate, Pod, PodSpec, PodTemplateSpec, ResourceRequirements,
+    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, PostParams};
+use kube::api::{Api, ListParams, LogParams, PostParams};
 use kube::Client as KubeClient;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -195,7 +195,7 @@ async fn reconcile_active(
                     // A terminal K8s failure can kill the runner before it
                     // posts its own error comment. Notify from this reliable
                     // controller-owned lifecycle boundary instead.
-                    post_terminal_failure_comment(config, gh, &job, reason, message).await;
+                    post_terminal_failure_comment(config, gh, kube, &job, reason, message).await;
                 }
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -229,16 +229,22 @@ async fn reconcile_active(
 async fn post_terminal_failure_comment(
     config: &Config,
     gh: &GitHubClient,
+    kube: &KubeClient,
     job: &BenchmarkJob,
     reason: &str,
     k8s_message: &str,
 ) {
+    let log_tail = match job.k8s_job_name.as_deref() {
+        Some(name) => failed_pod_log_tail(kube, &config.k8s_namespace, name).await,
+        None => String::new(),
+    };
     let body = terminal_failure_comment_body(
         config.active_deadline_secs,
         config.runner_repo_url.as_deref(),
         job,
         reason,
         k8s_message,
+        &log_tail,
     );
     if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &body).await {
         warn!(
@@ -257,6 +263,7 @@ fn terminal_failure_comment_body(
     job: &BenchmarkJob,
     reason: &str,
     k8s_message: &str,
+    log_tail: &str,
 ) -> String {
     let benchmarks = serde_json::from_str::<Vec<String>>(&job.benchmarks)
         .map(|v| v.join(", "))
@@ -271,6 +278,17 @@ fn terminal_failure_comment_body(
             "\n\n<details><summary>Kubernetes message</summary>\n\n{fence}\n{k8s_message}\n{fence}\n\n</details>"
         )
     };
+    // The Kubernetes reason says the pod exited non-zero, never why. The
+    // runner's own last words do, so lead the details with them.
+    let log_detail = if log_tail.is_empty() {
+        String::new()
+    } else {
+        let fence = markdown_code_fence(log_tail);
+        format!(
+            "\n\n<details><summary>Runner log (last {POD_LOG_TAIL_LINES} lines)</summary>\n\n{fence}\n{log_tail}\n{fence}\n\n</details>"
+        )
+    };
+    let k8s_detail = format!("{log_detail}{k8s_detail}");
 
     if reason == "DeadlineExceeded" {
         format!(
@@ -287,6 +305,58 @@ fn terminal_failure_comment_body(
             "Benchmark for [this request]({comment_url}) failed before finishing (Kubernetes reason: `{reason}`).\n\n\
              Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
         )
+    }
+}
+
+/// How much of the failed pod's log to quote back into the PR comment. Enough
+/// to carry a cargo error and the command that produced it, short enough that
+/// the comment stays readable when expanded.
+const POD_LOG_TAIL_LINES: i64 = 40;
+
+/// Tail of the failed pod's log, for the terminal-failure comment.
+///
+/// A benchmark that fails on its own terms (an unknown bench name, a target
+/// whose `required-features` are not enabled, a compile error) dies inside the
+/// pod, and the Job condition the controller sees carries only
+/// `BackoffLimitExceeded`. Quoting the log puts the actual cause in the PR,
+/// where the person who triggered the run can read it without cluster access.
+///
+/// Best effort: any failure here yields an empty string and the comment simply
+/// omits the section, rather than losing the notification altogether.
+async fn failed_pod_log_tail(kube: &KubeClient, namespace: &str, k8s_job_name: &str) -> String {
+    let pods: Api<Pod> = Api::namespaced(kube.clone(), namespace);
+    let list_params = ListParams::default().labels(&format!("job-name={k8s_job_name}"));
+    let pod_list = match pods.list(&list_params).await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!(k8s_job_name, error = %e, "failed to list pods for failed job");
+            return String::new();
+        }
+    };
+
+    // The newest pod is the one that failed last. `backoffLimit` is 0, so there
+    // is normally exactly one, but a preempted spot node can leave an earlier
+    // pod behind whose log describes a different run.
+    let Some(pod_name) = pod_list
+        .items
+        .iter()
+        .max_by_key(|p| p.metadata.creation_timestamp.clone().map(|t| t.0))
+        .and_then(|p| p.metadata.name.clone())
+    else {
+        warn!(k8s_job_name, "no pods found for failed job");
+        return String::new();
+    };
+
+    let log_params = LogParams {
+        tail_lines: Some(POD_LOG_TAIL_LINES),
+        ..Default::default()
+    };
+    match pods.logs(&pod_name, &log_params).await {
+        Ok(logs) => logs.trim_end().to_string(),
+        Err(e) => {
+            warn!(pod_name, error = %e, "failed to read log of failed pod");
+            String::new()
+        }
     }
 }
 
@@ -744,6 +814,7 @@ mod tests {
             &test_job(),
             "BackoffLimitExceeded",
             "Pod runner exited with status 1",
+            "",
         );
 
         assert!(body.contains("failed before finishing"));
@@ -751,9 +822,65 @@ mod tests {
         assert!(body.contains("Pod runner exited with status 1"));
     }
 
+    /// The Kubernetes reason never names a cause, so the runner's own log tail
+    /// is what makes the comment actionable. It leads the details, ahead of the
+    /// Kubernetes message.
+    #[test]
+    fn terminal_failure_comment_quotes_the_runner_log() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "Job has reached the specified backoff limit",
+            "error: target `multi_group_by` in package `datafusion-physical-plan` requires the features: `test_utils`",
+        );
+
+        assert!(body.contains("<details><summary>Runner log (last 40 lines)</summary>"));
+        assert!(body.contains("requires the features: `test_utils`"));
+        assert!(
+            body.find("Runner log").unwrap() < body.find("Kubernetes message").unwrap(),
+            "the cause should come before the Kubernetes reason"
+        );
+    }
+
+    /// An unreadable pod log drops the section rather than the notification.
+    #[test]
+    fn terminal_failure_comment_omits_an_empty_runner_log() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "Job has reached the specified backoff limit",
+            "",
+        );
+
+        assert!(!body.contains("Runner log"));
+        assert!(body.contains("Kubernetes message"));
+    }
+
+    /// A log tail is pod output, so it gets the same fence widening as the
+    /// Kubernetes message: a benchmark that prints a fence cannot break out of
+    /// the block and inject Markdown into the comment.
+    #[test]
+    fn terminal_failure_comment_uses_safe_fence_for_runner_log() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "",
+            "runner output:\n```\nuntrusted markdown\n```",
+        );
+
+        assert!(body.contains("````\nrunner output:\n```\nuntrusted markdown\n```\n````"));
+    }
+
     #[test]
     fn deadline_exceeded_comment_keeps_existing_text() {
-        let body = terminal_failure_comment_body(7200, None, &test_job(), "DeadlineExceeded", "");
+        let body =
+            terminal_failure_comment_body(7200, None, &test_job(), "DeadlineExceeded", "", "");
 
         assert_eq!(
             body,
@@ -769,6 +896,7 @@ mod tests {
             &test_job(),
             "BackoffLimitExceeded",
             "pod output:\n```\nuntrusted markdown\n```",
+            "",
         );
 
         assert!(body.contains("````\npod output:\n```\nuntrusted markdown\n```\n````"));

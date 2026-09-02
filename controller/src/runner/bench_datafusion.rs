@@ -6,7 +6,8 @@
 //!
 //! * If the name is a real Criterion `[[bench]]` target in the `benchmarks`
 //!   crate (discovered via `cargo metadata`), it is run with
-//!   `cargo bench --bench <name> -- --save-baseline <side>`.
+//!   `cargo bench --bench <name> -- --save-baseline <side>`, enabling whatever
+//!   `required-features` that target declares.
 //! * Otherwise it is run through `bench.sh run <name>` (TPC-H variants take a
 //!   direct `dfbench` shortcut). `bench.sh` itself runs some suites through the
 //!   Criterion SQL harness (`wide_schema`, …) and others through `dfbench`.
@@ -20,7 +21,7 @@
 //! are additionally read here for `pool_peak_bytes` — see
 //! [`pool_peak`](super::pool_peak).
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -81,7 +82,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     // bench target added in the PR is recognized.
     let requested: Vec<String> = benchmarks.split_whitespace().map(String::from).collect();
     let bench_targets = criterion_bench_targets(&branch_dir.join("benchmarks")).await;
-    let is_criterion = |bench: &str| bench_targets.contains(bench);
+    let is_criterion = |bench: &str| bench_targets.contains_key(bench);
     let any_shell = requested.iter().any(|b| !is_criterion(b));
 
     // dfbench is only needed for the bench.sh / TPC-H path. Build it for both
@@ -208,6 +209,10 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
 
     for bench in &requested {
         if is_criterion(bench) {
+            let required_features = bench_targets
+                .get(bench)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             info!("** Setting up data for criterion bench {bench} **");
             setup_criterion_data(bench, &branch_dir, &base_dir).await;
 
@@ -218,6 +223,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 &base_results_name,
                 &config.bench_filter,
                 &baseline_extra_env,
+                required_features,
             )
             .await
             {
@@ -239,6 +245,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 &bench_branch_name,
                 &config.bench_filter,
                 &changed_extra_env,
+                required_features,
             )
             .await
             .with_context(|| format!("run {bench} (branch, criterion)"))?;
@@ -395,11 +402,12 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     Ok(())
 }
 
-/// Discover Criterion `[[bench]]` target names in the `benchmarks` crate via
-/// `cargo metadata`. Returns an empty set on any failure — the caller then
+/// Discover Criterion `[[bench]]` targets in the `benchmarks` crate via
+/// `cargo metadata`, keyed by target name and carrying each target's
+/// `required-features`. Returns an empty map on any failure — the caller then
 /// treats every name as a `bench.sh` suite (which itself reports unknown
 /// names), so a metadata hiccup degrades gracefully rather than misrouting.
-async fn criterion_bench_targets(crate_dir: &Path) -> HashSet<String> {
+async fn criterion_bench_targets(crate_dir: &Path) -> BTreeMap<String, Vec<String>> {
     let out = match shell::run_command(
         "cargo",
         &["metadata", "--no-deps", "--format-version", "1"],
@@ -410,15 +418,23 @@ async fn criterion_bench_targets(crate_dir: &Path) -> HashSet<String> {
         Ok(out) => out,
         Err(e) => {
             warn!("cargo metadata failed; treating all benches as bench.sh suites: {e:#}");
-            return HashSet::new();
+            return BTreeMap::new();
         }
     };
     parse_bench_targets(&out)
 }
 
-/// Extract names of `bench`-kind targets from `cargo metadata` JSON.
-fn parse_bench_targets(metadata_json: &str) -> HashSet<String> {
-    let mut targets = HashSet::new();
+/// Extract `bench`-kind targets from `cargo metadata` JSON, keyed by target
+/// name and carrying the target's `required-features`.
+///
+/// The features are load-bearing: cargo refuses to run a bench target whose
+/// `required-features` are not enabled, and exits non-zero saying so rather
+/// than skipping it. `multi_group_by` in `datafusion-physical-plan` needs
+/// `test_utils`, for one. Target names are unique across the workspace in
+/// practice, but a collision takes the union of the requirements, because the
+/// run selects the target by name across every member.
+fn parse_bench_targets(metadata_json: &str) -> BTreeMap<String, Vec<String>> {
+    let mut targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
         return targets;
     };
@@ -435,14 +451,41 @@ fn parse_bench_targets(metadata_json: &str) -> HashSet<String> {
                 .and_then(|k| k.as_array())
                 .map(|kinds| kinds.iter().any(|k| k.as_str() == Some("bench")))
                 .unwrap_or(false);
-            if is_bench {
-                if let Some(name) = target.get("name").and_then(|n| n.as_str()) {
-                    targets.insert(name.to_string());
+            if !is_bench {
+                continue;
+            }
+            let Some(name) = target.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let entry = targets.entry(name.to_string()).or_default();
+            let required = target
+                .get("required-features")
+                .and_then(|f| f.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for feature in required.iter().filter_map(|f| f.as_str()) {
+                if !entry.iter().any(|f| f == feature) {
+                    entry.push(feature.to_string());
                 }
             }
         }
     }
     targets
+}
+
+/// The `--features` flag for a Criterion run: `parquet`, which the DataFusion
+/// bench targets have always been run with, plus the target's own
+/// `required-features`. The run is invoked from the workspace root, where
+/// cargo resolves each bare feature name against the members that declare it,
+/// so features owned by different packages can be listed together.
+fn criterion_features_arg(required_features: &[String]) -> String {
+    let mut features = vec!["parquet".to_string()];
+    for feature in required_features {
+        if !features.contains(feature) {
+            features.push(feature.clone());
+        }
+    }
+    format!("--features={}", features.join(","))
 }
 
 /// Run a Criterion bench target on one side, saving a named baseline.
@@ -455,10 +498,11 @@ async fn run_criterion_side(
     baseline_name: &str,
     bench_filter: &str,
     extra_env: &[String],
+    required_features: &[String],
 ) -> Result<ResourceStats> {
     let mut bench_args: Vec<String> = vec![
         "bench".into(),
-        "--features=parquet".into(),
+        criterion_features_arg(required_features),
         "--bench".into(),
         bench.into(),
         "--".into(),
@@ -907,16 +951,72 @@ mod tests {
             ]
         }"#;
         let targets = parse_bench_targets(json);
-        assert!(targets.contains("sql_planner"));
-        assert!(targets.contains("sql"));
-        assert!(!targets.contains("dfbench"));
-        assert!(!targets.contains("datafusion-benchmarks"));
+        assert!(targets.contains_key("sql_planner"));
+        assert!(targets.contains_key("sql"));
+        assert!(!targets.contains_key("dfbench"));
+        assert!(!targets.contains_key("datafusion-benchmarks"));
+    }
+
+    /// A target that declares `required-features` carries them through, so the
+    /// run can enable them. `multi_group_by` failed both sides of
+    /// apache/datafusion#23648 because `test_utils` was dropped here.
+    #[test]
+    fn parse_bench_targets_carries_required_features() {
+        let json = r#"{
+            "packages": [
+                {"targets": [
+                    {"name": "sql_planner", "kind": ["bench"]},
+                    {
+                        "name": "multi_group_by",
+                        "kind": ["bench"],
+                        "required-features": ["test_utils"]
+                    }
+                ]}
+            ]
+        }"#;
+        let targets = parse_bench_targets(json);
+        assert_eq!(targets["multi_group_by"], vec!["test_utils".to_string()]);
+        assert!(targets["sql_planner"].is_empty());
+    }
+
+    /// Two packages naming the same bench target contribute both requirements,
+    /// because `--bench <name>` selects across the whole workspace.
+    #[test]
+    fn parse_bench_targets_unions_colliding_names() {
+        let json = r#"{
+            "packages": [
+                {"targets": [
+                    {"name": "shared", "kind": ["bench"], "required-features": ["a"]}
+                ]},
+                {"targets": [
+                    {"name": "shared", "kind": ["bench"], "required-features": ["a", "b"]}
+                ]}
+            ]
+        }"#;
+        assert_eq!(
+            parse_bench_targets(json)["shared"],
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
     fn parse_bench_targets_handles_garbage() {
         assert!(parse_bench_targets("not json").is_empty());
         assert!(parse_bench_targets("{}").is_empty());
+    }
+
+    #[test]
+    fn criterion_features_arg_appends_required_features() {
+        assert_eq!(criterion_features_arg(&[]), "--features=parquet");
+        assert_eq!(
+            criterion_features_arg(&["test_utils".to_string()]),
+            "--features=parquet,test_utils"
+        );
+        // A target that requires `parquet` itself does not repeat it.
+        assert_eq!(
+            criterion_features_arg(&["parquet".to_string()]),
+            "--features=parquet"
+        );
     }
 
     #[test]
