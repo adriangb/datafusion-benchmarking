@@ -201,6 +201,8 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                 "mzabaluev", "sdf-jkl", "liamzwbao", "cetra3", "brunal",
                 "Fokko", "kunalsinghdadhwal", "grtlr", "codephage2020", "asubiotto",
                 "Rich-T-kid", "avantgardnerio", "jayzhan211",
+                // other contributors
+                "gruuya",
               ],
               // No benchmark allowlist: any requested name is scheduled and
               // resolved on the runner. `kind` selects how the repo runs
