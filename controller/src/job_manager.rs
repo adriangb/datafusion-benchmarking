@@ -498,12 +498,16 @@ async fn create_k8s_job(
         // gdb dumps from hung jobs by adding a shared `env:` block to the
         // trigger comment (shared env is inherited by the build processes,
         // unlike per-side `baseline:`/`changed:` env which only reaches the
-        // benchmark run). To keep memory in check, pair it with a job cap:
+        // benchmark run):
         //
         //   run benchmark <name>
         //   env:
         //     CARGO_PROFILE_RELEASE_DEBUG: "1"
-        //     CARGO_BUILD_JOBS: "1"
+        //
+        // The job cap that used to pair with this is now forced by the runner
+        // (see runner/build_env.rs), and a trigger cannot lower it. Debuginfo
+        // makes each rustc much larger, so if such a run is OOM-killed, lower
+        // the cap there instead.
     ];
 
     // The controller resolves the PR's source branch and hands it to the

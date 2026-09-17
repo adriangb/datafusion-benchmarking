@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::github;
+use crate::runner::build_env;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
@@ -512,11 +513,15 @@ async fn run_criterion_side(
     if !bench_filter.is_empty() {
         bench_args.push(bench_filter.to_string());
     }
+    // The runner's own env already carries the forced build settings, so the
+    // plain `cargo` call inherits them; the `env` call has to re-assert them
+    // after the trigger's per-side vars.
     let (_, stats) = if extra_env.is_empty() {
         let args_ref: Vec<&str> = bench_args.iter().map(|s| s.as_str()).collect();
         shell::run_command_monitored("cargo", &args_ref, side_dir, None).await?
     } else {
         let mut env_args: Vec<String> = extra_env.to_vec();
+        env_args.extend(build_env::args());
         env_args.push("cargo".to_string());
         env_args.extend(bench_args);
         let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
@@ -556,17 +561,7 @@ async fn run_shell_side(
         )
         .await
     } else {
-        let mut args: Vec<String> = vec![
-            format!("DATAFUSION_DIR={}", side_dir.display()),
-            format!("RESULTS_NAME={results_name}"),
-            format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
-            // Suites that bench.sh runs through the Criterion SQL harness read
-            // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
-            // dfbench-based suites (which never read it) and saves a named
-            // baseline per side for the ones that do, so we can critcmp them.
-            format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
-        ];
-        args.extend(extra_env.iter().cloned());
+        let mut args = shell_side_env_args(side_dir, results_name, spill_dir, extra_env);
         args.extend([
             "./bench.sh".to_string(),
             "run".to_string(),
@@ -582,6 +577,32 @@ async fn run_shell_side(
         .await?;
         Ok(stats)
     }
+}
+
+/// `KEY=VALUE` args passed to `env` ahead of `./bench.sh run`. `env` applies
+/// them left to right, so the per-side `extra_env` overrides the runner's
+/// defaults, and [`build_env`]'s settings come last so nothing overrides them.
+fn shell_side_env_args(
+    side_dir: &Path,
+    results_name: &str,
+    spill_dir: &Path,
+    extra_env: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        format!("DATAFUSION_DIR={}", side_dir.display()),
+        format!("RESULTS_NAME={results_name}"),
+        format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
+        // Suites that bench.sh runs through the Criterion SQL harness read
+        // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
+        // dfbench-based suites (which never read it) and saves a named
+        // baseline per side for the ones that do, so we can critcmp them.
+        format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
+    ];
+    args.extend(extra_env.iter().cloned());
+    // Also overrides the trigger's shared `env:` block, which the runner
+    // inherits from the pod.
+    args.extend(build_env::args());
+    args
 }
 
 /// Map a TPC-H bench name to (dfbench tpch args, results JSON filename).
@@ -866,6 +887,15 @@ fn format_result_comment(
 mod tests {
     use super::*;
 
+    /// Value of the last `KEY=VALUE` assignment to `key` in `env_args`.
+    fn last_assignment(env_args: &[String], key: &str) -> Option<String> {
+        env_args.iter().rev().find_map(|a| {
+            a.split_once('=')
+                .filter(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
     #[test]
     fn result_comment_format() {
         let comment = format_result_comment(
@@ -1030,6 +1060,67 @@ mod tests {
     #[test]
     fn required_datasets_unknown_is_empty() {
         assert!(required_datasets("wide_schema").is_empty());
+    }
+
+    fn side_env(extra_env: &[&str]) -> Vec<String> {
+        let extra_env: Vec<String> = extra_env.iter().map(|s| s.to_string()).collect();
+        shell_side_env_args(
+            Path::new("/workspace/base"),
+            "HEAD",
+            Path::new("/workspace/spill"),
+            &extra_env,
+        )
+    }
+
+    #[test]
+    fn shell_side_env_forces_build_settings() {
+        let args = side_env(&["RUST_LOG=debug"]);
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("thin")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            last_assignment(&args, "SQL_CARGO_COMMAND").as_deref(),
+            Some("cargo bench --bench sql -- --save-baseline HEAD")
+        );
+        assert_eq!(last_assignment(&args, "RUST_LOG").as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn shell_side_env_trigger_cannot_override_build_settings() {
+        // Per-side env comes through `extra_env`. The shared env block is
+        // inherited, and any explicit arg overrides it, so the forced args
+        // win over both.
+        let args = side_env(&[
+            "CARGO_PROFILE_BENCH_LTO=fat",
+            "CARGO_PROFILE_RELEASE_LTO=fat",
+            "CARGO_BUILD_JOBS=12",
+        ]);
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("thin")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_RELEASE_LTO").as_deref(),
+            Some("thin")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_per_side_env_still_applies() {
+        let args = side_env(&["DATAFUSION_RUNTIME_MEMORY_LIMIT=2G"]);
+        assert_eq!(
+            last_assignment(&args, "DATAFUSION_RUNTIME_MEMORY_LIMIT").as_deref(),
+            Some("2G")
+        );
     }
 
     #[test]

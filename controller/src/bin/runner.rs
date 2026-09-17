@@ -9,7 +9,7 @@ use tracing::{error, info};
 use benchmark_controller::github;
 use benchmark_controller::runner::config::{BenchType, PosterMode, RunnerConfig};
 use benchmark_controller::runner::poster::CommentPoster;
-use benchmark_controller::runner::{bench_arrow, bench_datafusion, shell, trigger};
+use benchmark_controller::runner::{bench_arrow, bench_datafusion, build_env, shell, trigger};
 
 #[tokio::main]
 async fn main() {
@@ -36,6 +36,9 @@ async fn main() {
 
     // Set up sccache if configured
     config.setup_sccache();
+
+    // Force the LTO mode and job cap every cargo build runs with.
+    build_env::apply();
 
     info!(
         bench_type = ?config.bench_type,

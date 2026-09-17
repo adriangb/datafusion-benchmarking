@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::github;
+use crate::runner::build_env;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor;
@@ -157,6 +158,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 .await?
         } else {
             let mut env_args: Vec<String> = baseline_extra_env;
+            env_args.extend(build_env::args());
             env_args.push("cargo".to_string());
             env_args.extend(base_run_args);
             shell::run_command_monitored("env", &str_slice(&env_args), &base_dir, None).await?
@@ -180,6 +182,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             .await?
     } else {
         let mut env_args: Vec<String> = changed_extra_env;
+        env_args.extend(build_env::args());
         env_args.push("cargo".to_string());
         env_args.extend(branch_run_args);
         shell::run_command_monitored("env", &str_slice(&env_args), &branch_dir, None).await?

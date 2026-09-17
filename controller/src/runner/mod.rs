@@ -1,5 +1,6 @@
 pub mod bench_arrow;
 pub mod bench_datafusion;
+pub mod build_env;
 pub mod config;
 pub mod controller_client;
 pub mod git;

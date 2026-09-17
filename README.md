@@ -129,6 +129,22 @@ changed:
 
 Per-side env vars override shared env vars when both set the same key.
 
+### Forced build settings
+
+DataFusion's release profile sets `lto = true` and `codegen-units = 1`, and the bench profile inherits it. A fat-LTO link peaks at 13-15 GB. `cargo bench --bench sql`, which runs the bench.sh SQL suites, links 7 binaries, so parallel links exceeded the 65 GiB pod limit and the pod was OOM-killed before any query ran. The two `dfbench` builds, which run for both sides at once, link one binary each at the same cost.
+
+The runner therefore forces these settings on every cargo build it starts, on both sides:
+
+| Variable | Value | Why |
+|---|---|---|
+| `CARGO_PROFILE_RELEASE_LTO` | `thin` | About 5 GB per link. Measured within ±1-2% of fat LTO at run time. `off` is about 5% slower. |
+| `CARGO_PROFILE_BENCH_LTO` | `thin` | Same, for `cargo bench` builds. |
+| `CARGO_BUILD_JOBS` | `5` | Limits parallel compiles and links. Measured on a 12-core host, a build from scratch took 14.0 min at 5 jobs against 11.9 min uncapped. At 3 jobs it took 17.6 min. |
+
+Both sides of a comparison build the same way, so comparisons are unaffected. Absolute timings move by about 1-2% against runs made before this change.
+
+A trigger's `env:` blocks cannot override these three variables. A build that is OOM-killed or times out gives no result at all. The values suit the default build: a run that also asks for debuginfo with `CARGO_PROFILE_RELEASE_DEBUG` makes each rustc much larger and may need the cap lowered in [controller/src/runner/build_env.rs](controller/src/runner/build_env.rs).
+
 ### What ran: the Run configuration block
 
 Every comment the runner posts — running, completed, and failed — states what it
