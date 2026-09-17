@@ -556,17 +556,9 @@ async fn run_shell_side(
         )
         .await
     } else {
-        let mut args: Vec<String> = vec![
-            format!("DATAFUSION_DIR={}", side_dir.display()),
-            format!("RESULTS_NAME={results_name}"),
-            format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
-            // Suites that bench.sh runs through the Criterion SQL harness read
-            // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
-            // dfbench-based suites (which never read it) and saves a named
-            // baseline per side for the ones that do, so we can critcmp them.
-            format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
-        ];
-        args.extend(extra_env.iter().cloned());
+        let mut args = shell_side_env_args(side_dir, results_name, spill_dir, extra_env, &|key| {
+            std::env::var(key).ok()
+        });
         args.extend([
             "./bench.sh".to_string(),
             "run".to_string(),
@@ -582,6 +574,82 @@ async fn run_shell_side(
         .await?;
         Ok(stats)
     }
+}
+
+/// Memory (GB) that concurrent links in the bench.sh SQL-suite build may use:
+/// the 65 GiB (~69 GB) pod less ~19 GB for rustc processes still compiling
+/// during the links, the runner, and the page cache charged to the cgroup.
+const SQL_BUILD_LINK_BUDGET_GB: u64 = 50;
+
+/// Peak memory (GB) of one bench-binary link at `codegen-units = 1`.
+/// Measured: ~5 GB at `lto = "thin"`, 13-15 GB at fat LTO (DataFusion's
+/// release profile, which the bench profile inherits). Values that do less
+/// LTO work than thin are rated as thin; anything else as fat.
+fn link_peak_gb(lto: &str) -> u64 {
+    match lto {
+        "thin" | "off" | "false" | "no" => 5,
+        _ => 15,
+    }
+}
+
+/// `CARGO_BUILD_JOBS` for the SQL-suite build. `cargo bench --bench sql`
+/// links 7 binaries, and cargo runs up to `jobs` links at once, so we
+/// allow as many concurrent links as fit in the budget: 50 / 5 = 10 at
+/// thin LTO (7 links, ~35 GB), 50 / 15 = 3 at fat LTO (~45 GB). A lower cap
+/// costs wall time (`jobs = 3` added ~30% to a fat-LTO run), so do not cap
+/// below what the budget needs. The dfbench builds, which run base and branch
+/// in parallel, finish before this build starts and link one binary each.
+fn sql_build_jobs(lto: &str) -> u64 {
+    (SQL_BUILD_LINK_BUDGET_GB / link_peak_gb(lto)).max(1)
+}
+
+/// `KEY=VALUE` args passed to `env` ahead of `./bench.sh run`.
+///
+/// `inherited` looks up the runner's own environment, which holds the
+/// trigger's shared `env:` block (set on the pod). `extra_env` holds the
+/// per-side block; `env` applies args left to right, so it comes last and
+/// wins. Build defaults are added only when neither level sets the key.
+fn shell_side_env_args(
+    side_dir: &Path,
+    results_name: &str,
+    spill_dir: &Path,
+    extra_env: &[String],
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        format!("DATAFUSION_DIR={}", side_dir.display()),
+        format!("RESULTS_NAME={results_name}"),
+        format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
+        // Suites that bench.sh runs through the Criterion SQL harness read
+        // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
+        // dfbench-based suites (which never read it) and saves a named
+        // baseline per side for the ones that do, so we can critcmp them.
+        format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
+    ];
+    let lookup = |key: &str| last_assignment(extra_env, key).or_else(|| inherited(key));
+
+    // The bench profile inherits DataFusion's fat LTO, and the SQL-suite
+    // build OOM-kills the pod with it. Thin LTO measured within ±1-2% of fat.
+    // Do not default to `off`: it measured ~5% slower.
+    let lto = lookup("CARGO_PROFILE_BENCH_LTO").unwrap_or_else(|| {
+        args.push("CARGO_PROFILE_BENCH_LTO=thin".to_string());
+        "thin".to_string()
+    });
+    if lookup("CARGO_BUILD_JOBS").is_none() {
+        args.push(format!("CARGO_BUILD_JOBS={}", sql_build_jobs(&lto)));
+    }
+
+    args.extend(extra_env.iter().cloned());
+    args
+}
+
+/// Value of the last `KEY=VALUE` assignment to `key` in `env_args`.
+fn last_assignment(env_args: &[String], key: &str) -> Option<String> {
+    env_args.iter().rev().find_map(|a| {
+        a.split_once('=')
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v.to_string())
+    })
 }
 
 /// Map a TPC-H bench name to (dfbench tpch args, results JSON filename).
@@ -865,6 +933,7 @@ fn format_result_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn result_comment_format() {
@@ -1030,6 +1099,113 @@ mod tests {
     #[test]
     fn required_datasets_unknown_is_empty() {
         assert!(required_datasets("wide_schema").is_empty());
+    }
+
+    fn side_env(extra_env: &[&str], inherited: &[(&str, &str)]) -> Vec<String> {
+        let extra_env: Vec<String> = extra_env.iter().map(|s| s.to_string()).collect();
+        let inherited: HashMap<String, String> = inherited
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        shell_side_env_args(
+            Path::new("/workspace/base"),
+            "HEAD",
+            Path::new("/workspace/spill"),
+            &extra_env,
+            &|key| inherited.get(key).cloned(),
+        )
+    }
+
+    /// What `env` passes on for `key`: the last assignment, else the
+    /// inherited value.
+    fn effective(args: &[String], inherited: &[(&str, &str)], key: &str) -> Option<String> {
+        last_assignment(args, key).or_else(|| {
+            inherited
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn shell_side_env_defaults_to_thin_lto_and_job_cap() {
+        let args = side_env(&["RUST_LOG=debug"], &[]);
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("thin")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            last_assignment(&args, "SQL_CARGO_COMMAND").as_deref(),
+            Some("cargo bench --bench sql -- --save-baseline HEAD")
+        );
+        assert_eq!(args.last().map(String::as_str), Some("RUST_LOG=debug"));
+    }
+
+    #[test]
+    fn shell_side_env_shared_env_overrides_defaults() {
+        // The shared `env:` block reaches the runner as its own environment.
+        let inherited = [
+            ("CARGO_PROFILE_BENCH_LTO", "fat"),
+            ("CARGO_BUILD_JOBS", "2"),
+        ];
+        let args = side_env(&[], &inherited);
+        assert_eq!(last_assignment(&args, "CARGO_PROFILE_BENCH_LTO"), None);
+        assert_eq!(last_assignment(&args, "CARGO_BUILD_JOBS"), None);
+        assert_eq!(
+            effective(&args, &inherited, "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("fat")
+        );
+        assert_eq!(
+            effective(&args, &inherited, "CARGO_BUILD_JOBS").as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_fat_lto_lowers_job_cap() {
+        let inherited = [("CARGO_PROFILE_BENCH_LTO", "true")];
+        let args = side_env(&[], &inherited);
+        assert_eq!(
+            last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_per_side_env_overrides_defaults() {
+        let args = side_env(
+            &["CARGO_PROFILE_BENCH_LTO=fat", "CARGO_BUILD_JOBS=4"],
+            &[("CARGO_PROFILE_BENCH_LTO", "thin")],
+        );
+        assert_eq!(
+            effective(&args, &[], "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("fat")
+        );
+        assert_eq!(
+            effective(&args, &[], "CARGO_BUILD_JOBS").as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_per_side_fat_lto_lowers_job_cap() {
+        let args = side_env(&["CARGO_PROFILE_BENCH_LTO=fat"], &[]);
+        assert_eq!(
+            effective(&args, &[], "CARGO_BUILD_JOBS").as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn sql_build_jobs_fits_memory_budget() {
+        assert_eq!(sql_build_jobs("thin"), 10);
+        assert_eq!(sql_build_jobs("off"), 10);
+        assert_eq!(sql_build_jobs("fat"), 3);
+        assert_eq!(sql_build_jobs("true"), 3);
     }
 
     #[test]
