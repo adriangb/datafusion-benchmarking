@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::github;
+use crate::runner::build_env;
 use crate::runner::config::RunnerConfig;
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
@@ -512,11 +513,15 @@ async fn run_criterion_side(
     if !bench_filter.is_empty() {
         bench_args.push(bench_filter.to_string());
     }
+    // The runner's own env already carries the forced build settings, so the
+    // plain `cargo` call inherits them; the `env` call has to re-assert them
+    // after the trigger's per-side vars.
     let (_, stats) = if extra_env.is_empty() {
         let args_ref: Vec<&str> = bench_args.iter().map(|s| s.as_str()).collect();
         shell::run_command_monitored("cargo", &args_ref, side_dir, None).await?
     } else {
         let mut env_args: Vec<String> = extra_env.to_vec();
+        env_args.extend(build_env::args());
         env_args.push("cargo".to_string());
         env_args.extend(bench_args);
         let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
@@ -574,32 +579,9 @@ async fn run_shell_side(
     }
 }
 
-/// `CARGO_BUILD_JOBS` for the bench.sh SQL-suite build. See
-/// [`SQL_BUILD_FORCED_ENV`].
-const SQL_BUILD_JOBS: u32 = 5;
-
-/// Build settings forced on the bench.sh SQL-suite build, on both sides.
-///
-/// `cargo bench --bench sql` links 7 binaries under the bench profile, which
-/// inherits DataFusion's fat LTO (`lto = true`, `codegen-units = 1`). Each
-/// fat-LTO link peaks at 13-15 GB, so parallel links exceeded the 65 GiB pod
-/// and it was OOM-killed. Thin LTO peaks at ~5 GB per link and measured
-/// within ±1-2% of fat LTO at run time (`off` was ~5% slower). The job cap
-/// bounds how many links (and compiles) run at once, so the worst case is
-/// 5 x ~5 GB = ~25 GB, well inside the pod. It was measured on a 12-core
-/// host: a from-scratch build took 14.0 min at 5 jobs against 11.9 min
-/// uncapped (+18%), while 3 jobs took 17.6 min (+48%). The trigger cannot
-/// override these: a build that OOMs or times out gives no result at all.
-fn sql_build_forced_env() -> [String; 2] {
-    [
-        "CARGO_PROFILE_BENCH_LTO=thin".to_string(),
-        format!("CARGO_BUILD_JOBS={SQL_BUILD_JOBS}"),
-    ]
-}
-
 /// `KEY=VALUE` args passed to `env` ahead of `./bench.sh run`. `env` applies
 /// them left to right, so the per-side `extra_env` overrides the runner's
-/// defaults, and the forced build settings come last so nothing overrides them.
+/// defaults, and [`build_env`]'s settings come last so nothing overrides them.
 fn shell_side_env_args(
     side_dir: &Path,
     results_name: &str,
@@ -619,7 +601,7 @@ fn shell_side_env_args(
     args.extend(extra_env.iter().cloned());
     // Also overrides the trigger's shared `env:` block, which the runner
     // inherits from the pod.
-    args.extend(sql_build_forced_env());
+    args.extend(build_env::args());
     args
 }
 
@@ -1091,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_side_env_forces_thin_lto_and_job_cap() {
+    fn shell_side_env_forces_build_settings() {
         let args = side_env(&["RUST_LOG=debug"]);
         assert_eq!(
             last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
@@ -1099,7 +1081,7 @@ mod tests {
         );
         assert_eq!(
             last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
-            Some(SQL_BUILD_JOBS.to_string().as_str())
+            Some("5")
         );
         assert_eq!(
             last_assignment(&args, "SQL_CARGO_COMMAND").as_deref(),
@@ -1113,14 +1095,22 @@ mod tests {
         // Per-side env comes through `extra_env`. The shared env block is
         // inherited, and any explicit arg overrides it, so the forced args
         // win over both.
-        let args = side_env(&["CARGO_PROFILE_BENCH_LTO=fat", "CARGO_BUILD_JOBS=12"]);
+        let args = side_env(&[
+            "CARGO_PROFILE_BENCH_LTO=fat",
+            "CARGO_PROFILE_RELEASE_LTO=fat",
+            "CARGO_BUILD_JOBS=12",
+        ]);
         assert_eq!(
             last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
             Some("thin")
         );
         assert_eq!(
             last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
-            Some(SQL_BUILD_JOBS.to_string().as_str())
+            Some("5")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_RELEASE_LTO").as_deref(),
+            Some("thin")
         );
     }
 
