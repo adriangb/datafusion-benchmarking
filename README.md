@@ -129,6 +129,23 @@ changed:
 
 Per-side env vars override shared env vars when both set the same key.
 
+### Build defaults for bench.sh SQL suites
+
+Suites that `bench.sh` runs through the Criterion SQL harness build with `cargo bench --bench sql`. That command links 7 binaries under the bench profile, which inherits DataFusion's fat LTO (`lto = true`, `codegen-units = 1`). Each fat-LTO link can use 13-15 GB, so parallel links can exceed the 65 GiB pod limit and the pod is OOM-killed. The runner therefore sets these defaults for that build on both sides:
+
+| Variable | Default | Why |
+|---|---|---|
+| `CARGO_PROFILE_BENCH_LTO` | `thin` | About 5 GB per link. Measured within ±1-2% of fat LTO. `off` is about 5% slower. Do not use it. |
+| `CARGO_BUILD_JOBS` | `10` with thin LTO, `3` with fat LTO | The maximum number of parallel links that fit in a 50 GB link budget (65 GiB minus headroom). |
+
+The runner applies a default only if the trigger does not set that variable. To build with fat LTO, set it in the shared `env:` block. The job cap then changes to `3`:
+
+```yaml
+run benchmark null_aware_join
+env:
+  CARGO_PROFILE_BENCH_LTO: fat
+```
+
 ### What ran: the Run configuration block
 
 Every comment the runner posts — running, completed, and failed — states what it
