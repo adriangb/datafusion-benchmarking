@@ -576,7 +576,7 @@ async fn run_shell_side(
 
 /// `CARGO_BUILD_JOBS` for the bench.sh SQL-suite build. See
 /// [`SQL_BUILD_FORCED_ENV`].
-const SQL_BUILD_JOBS: u32 = 4;
+const SQL_BUILD_JOBS: u32 = 5;
 
 /// Build settings forced on the bench.sh SQL-suite build, on both sides.
 ///
@@ -585,8 +585,10 @@ const SQL_BUILD_JOBS: u32 = 4;
 /// fat-LTO link peaks at 13-15 GB, so parallel links exceeded the 65 GiB pod
 /// and it was OOM-killed. Thin LTO peaks at ~5 GB per link and measured
 /// within ±1-2% of fat LTO at run time (`off` was ~5% slower). The job cap
-/// bounds how many links (and compiles) run at once: 4 x 5 GB leaves ample
-/// headroom, while the build still fits the job deadline. The trigger cannot
+/// bounds how many links (and compiles) run at once, so the worst case is
+/// 5 x ~5 GB = ~25 GB, well inside the pod. It was measured on a 12-core
+/// host: a from-scratch build took 14.0 min at 5 jobs against 11.9 min
+/// uncapped (+18%), while 3 jobs took 17.6 min (+48%). The trigger cannot
 /// override these: a build that OOMs or times out gives no result at all.
 fn sql_build_forced_env() -> [String; 2] {
     [

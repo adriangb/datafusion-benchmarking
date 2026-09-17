@@ -136,7 +136,7 @@ Suites that `bench.sh` runs through the Criterion SQL harness build with `cargo 
 | Variable | Value | Why |
 |---|---|---|
 | `CARGO_PROFILE_BENCH_LTO` | `thin` | About 5 GB per link. Measured within ±1-2% of fat LTO. `off` is about 5% slower. |
-| `CARGO_BUILD_JOBS` | `4` | Limits parallel compiles and links, so peak memory stays far below the pod limit. The build still finishes within the job deadline. |
+| `CARGO_BUILD_JOBS` | `5` | Limits parallel compiles and links, so the worst case is about 25 GB, far below the pod limit. Measured on a 12-core host, a build from scratch took 14.0 min at 5 jobs against 11.9 min uncapped. At 3 jobs it took 17.6 min. |
 
 The trigger's `env:` blocks cannot override these two variables for this build. A build that is OOM-killed or times out gives no result.
 
