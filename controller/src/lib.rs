@@ -6,4 +6,5 @@ pub mod github_poller;
 pub mod health;
 pub mod job_manager;
 pub mod models;
+pub mod resources;
 pub mod runner;

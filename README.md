@@ -129,6 +129,37 @@ changed:
 
 Per-side env vars override shared env vars when both set the same key.
 
+### Pod size and CPU architecture
+
+A run gets the controller's default pod: 12 vCPU, 65Gi of memory, on an ARM `c4a` node. A `resources:` block asks for something else:
+
+```yaml
+run benchmark tpch
+resources:
+  cpu: "16"
+  memory: "128Gi"
+  arch: arm64
+```
+
+Every key is optional, and a key you leave out keeps its default. `arch` is `arm64` or `amd64`, and selects the node's machine family (`c4a` or `c4`).
+
+`cpu` and `memory` are Kubernetes quantities. Requests and limits are set to the same value, which gives the pod Guaranteed QoS, so `cpu` is the number of cores the benchmark gets and `memory` is the point at which it is OOM-killed. Ephemeral storage stays at its own default and cannot be set from a trigger.
+
+Values are checked before the job is queued, and a bad one gets a reply on the PR instead of a pod that never starts:
+
+| Rule | Rejected example |
+|---|---|
+| `cpu` must be a Kubernetes CPU quantity above zero | `cpu: sixteen`, `cpu: 0` |
+| `memory` must be a Kubernetes memory quantity above zero | `memory: 128gi`, `memory: "1 Gi"` |
+| `memory` must not use the `m` suffix, which means milli-bytes | `memory: 128m` |
+| `arch` must be `arm64` or `amd64` | `arch: x86_64` |
+| `cpu` must not be above `MAX_CPU` (default `72`) | `cpu: 720` |
+| `memory` must not be above `MAX_MEMORY` (default `576Gi`) | `memory: 5760Gi` |
+
+The two caps are the largest `c4a` shape the Performance compute class offers. Raise them on the controller if the cluster can schedule more.
+
+The pod that ran is reported in each result comment: the **Instance:** line shows the node type and the pod's actual CPU and memory limits, and the **Run configuration** block repeats the `resources:` keys the trigger asked for.
+
 ### Forced build settings
 
 DataFusion's release profile sets `lto = true` and `codegen-units = 1`, and the bench profile inherits it. A fat-LTO link peaks at 13-15 GB. `cargo bench --bench sql`, which runs the bench.sh SQL suites, links 7 binaries, so parallel links exceeded the 65 GiB pod limit and the pod was OOM-killed before any query ran. The two `dfbench` builds, which run for both sides at once, link one binary each at the same cost.
@@ -167,6 +198,8 @@ baseline:
 changed:
   env:
     DATAFUSION_RUNTIME_MEMORY_LIMIT: "2G"
+resources:
+  memory: "128Gi"
 ```
 
 Sections with nothing to report are omitted, so an unconfigured run renders as
@@ -307,8 +340,10 @@ export WATCHED_REPOS="apache/datafusion:apache/arrow-rs"
 export POLL_INTERVAL_SECS=2
 export RECONCILE_INTERVAL_SECS=3
 export K8S_NAMESPACE="benchmarking"
-export DEFAULT_CPU=30
-export DEFAULT_MEMORY="60Gi"
+export DEFAULT_CPU=12
+export DEFAULT_MEMORY="65Gi"
+export MAX_CPU=72
+export MAX_MEMORY="576Gi"
 
 cargo run --manifest-path controller/Cargo.toml
 ```

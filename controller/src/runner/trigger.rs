@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::resources::PodResources;
 use crate::runner::config::RunnerConfig;
 
 /// The resolved two-sided comparison for a run.
@@ -82,6 +83,8 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         &config.changed_env_vars,
     );
 
+    push_resources(&mut lines, &config.resources);
+
     // A trigger comment sets the filter through the shared `env:` block, which
     // is already rendered above. Only the scheduled main-tracking workflow sets
     // BENCH_FILTER outside that block — note it there so it isn't lost.
@@ -90,6 +93,25 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Append the `resources:` section, omitting it when the pod was built from
+/// the controller defaults. Only the fields the trigger named are rendered,
+/// so the block keeps asking for the same pod when it is pasted back.
+fn push_resources(lines: &mut Vec<String>, resources: &PodResources) {
+    if resources.is_empty() {
+        return;
+    }
+    lines.push("resources:".to_string());
+    for (key, value) in [
+        ("cpu", &resources.cpu),
+        ("memory", &resources.memory),
+        ("arch", &resources.arch),
+    ] {
+        if let Some(value) = value {
+            lines.push(format!("  {key}: {}", quote(value)));
+        }
+    }
 }
 
 /// Append a `baseline:`/`changed:` section, omitting it when the side has
@@ -155,6 +177,7 @@ mod tests {
             baseline_ref: None,
             changed_ref: None,
             runner_repo_url: None,
+            resources: PodResources::default(),
         }
     }
 
@@ -208,9 +231,15 @@ mod tests {
         cfg.shared_env_vars = map(&[("CARGO_BUILD_JOBS", "1")]);
         cfg.baseline_ref = Some("v45.0.0".into());
         cfg.changed_env_vars = map(&[("DATAFUSION_RUNTIME_MEMORY_LIMIT", "2G")]);
+        cfg.resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
 
         let yaml = config_yaml(&cfg, "tpch clickbench_1");
-        let req = match crate::benchmarks::detect_benchmark(&yaml) {
+        let limits = crate::resources::ResourceLimits::default();
+        let req = match crate::benchmarks::detect_benchmark(&yaml, &limits) {
             crate::benchmarks::DetectResult::Parsed(req) => req,
             _ => panic!("re-rendered config did not parse: {yaml}"),
         };
@@ -222,6 +251,41 @@ mod tests {
                 .get("DATAFUSION_RUNTIME_MEMORY_LIMIT")
                 .unwrap(),
             "2G"
+        );
+        assert_eq!(req.resources, cfg.resources);
+    }
+
+    #[test]
+    fn yaml_omits_resources_for_a_default_sized_pod() {
+        assert_eq!(config_yaml(&config(), "tpch"), "run benchmark tpch");
+    }
+
+    #[test]
+    fn yaml_renders_the_requested_resources() {
+        let mut cfg = config();
+        cfg.resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
+        assert_eq!(
+            config_yaml(&cfg, "tpch"),
+            "run benchmark tpch\nresources:\n  cpu: \"16\"\n  memory: \"128Gi\"\n  arch: \"amd64\""
+        );
+    }
+
+    /// Only the fields the trigger named, so pasting the block back keeps the
+    /// rest on the controller defaults rather than pinning today's values.
+    #[test]
+    fn yaml_renders_only_the_requested_resource_fields() {
+        let mut cfg = config();
+        cfg.resources = PodResources {
+            memory: Some("128Gi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_yaml(&cfg, "tpch"),
+            "run benchmark tpch\nresources:\n  memory: \"128Gi\""
         );
     }
 

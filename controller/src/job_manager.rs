@@ -435,6 +435,46 @@ fn sanitize_label(s: &str) -> String {
     }
 }
 
+/// Where a benchmark pod runs and how big it is.
+///
+/// Each field is the job's own request when it has one, and the controller
+/// default otherwise.
+struct Placement<'a> {
+    cpu: &'a str,
+    memory: &'a str,
+    /// GCE machine family for the node selector.
+    machine_family: &'a str,
+    /// `kubernetes.io/arch` value matching `machine_family`.
+    arch: &'a str,
+}
+
+impl<'a> Placement<'a> {
+    fn resolve(
+        job: &'a BenchmarkJob,
+        default_cpu: &'a str,
+        default_memory: &'a str,
+        default_machine_family: &'a str,
+    ) -> Self {
+        // `x86_64` is not trigger syntax; it is accepted for rows written
+        // before the trigger could ask for an architecture.
+        let machine_family = match job.cpu_arch.as_deref() {
+            Some("arm64") => "c4a",
+            Some("amd64") | Some("x86_64") => "c4",
+            _ => default_machine_family,
+        };
+        Self {
+            cpu: job.cpu_request.as_deref().unwrap_or(default_cpu),
+            memory: job.memory_request.as_deref().unwrap_or(default_memory),
+            machine_family,
+            arch: if machine_family == "c4a" {
+                "arm64"
+            } else {
+                "amd64"
+            },
+        }
+    }
+}
+
 /// Build and submit a K8s Job spec for a benchmark row.
 ///
 /// Resource defaults come from [`Config`]. Tolerates GKE spot instances.
@@ -468,11 +508,18 @@ async fn create_k8s_job(
 
     let job_name = format!("bench-c{}-{}", job.comment_id, job.id);
 
-    let cpu = job.cpu_request.as_deref().unwrap_or(&config.default_cpu);
-    let memory = job
-        .memory_request
-        .as_deref()
-        .unwrap_or(&config.default_memory);
+    let placement = Placement::resolve(
+        job,
+        &config.default_cpu,
+        &config.default_memory,
+        &config.default_machine_family,
+    );
+    let Placement {
+        cpu,
+        memory,
+        machine_family,
+        arch,
+    } = placement;
 
     let mut env = vec![
         env_var("PR_URL", job.pr_url.clone()),
@@ -565,17 +612,19 @@ async fn create_k8s_job(
         env.push(env_var("RUNNER_REPO_URL", url.clone()));
     }
 
-    // Map per-job cpu_arch (arm64/amd64) to a machine family, or use the config default.
-    let machine_family = match job.cpu_arch.as_deref() {
-        Some("arm64") => "c4a",
-        Some("amd64") | Some("x86_64") => "c4",
-        _ => &config.default_machine_family,
-    };
-    let arch = if machine_family == "c4a" {
-        "arm64"
-    } else {
-        "amd64"
-    };
+    // Pass the trigger's own resource request, so the runner's "Run
+    // configuration" block reproduces the run instead of implying the
+    // defaults. The pod's actual limits reach the runner separately, through
+    // the Downward API vars below.
+    for (name, value) in [
+        ("REQUESTED_CPU", &job.cpu_request),
+        ("REQUESTED_MEMORY", &job.memory_request),
+        ("REQUESTED_ARCH", &job.cpu_arch),
+    ] {
+        if let Some(value) = value {
+            env.push(env_var(name, value.clone()));
+        }
+    }
 
     // Expose pod metadata via the Downward API so the runner can include
     // instance details in PR comments.
@@ -808,6 +857,65 @@ mod tests {
             updated_at: String::new(),
             runner_token: None,
         }
+    }
+
+    /// Every field falls back to the controller default.
+    #[test]
+    fn placement_without_a_request_uses_the_defaults() {
+        let job = test_job();
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.cpu, "12");
+        assert_eq!(placement.memory, "65Gi");
+        assert_eq!(placement.machine_family, "c4a");
+        assert_eq!(placement.arch, "arm64");
+    }
+
+    #[test]
+    fn placement_uses_the_requested_cpu_and_memory() {
+        let mut job = test_job();
+        job.cpu_request = Some("16".into());
+        job.memory_request = Some("128Gi".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.cpu, "16");
+        assert_eq!(placement.memory, "128Gi");
+        // Untouched by a size-only request.
+        assert_eq!(placement.machine_family, "c4a");
+    }
+
+    /// One field at a time: a CPU request must not also move the pod off the
+    /// default memory.
+    #[test]
+    fn placement_mixes_a_request_with_the_defaults() {
+        let mut job = test_job();
+        job.cpu_request = Some("32".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.cpu, "32");
+        assert_eq!(placement.memory, "65Gi");
+    }
+
+    #[test]
+    fn placement_maps_arch_to_a_machine_family() {
+        let mut job = test_job();
+
+        job.cpu_arch = Some("amd64".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.machine_family, "c4");
+        assert_eq!(placement.arch, "amd64");
+
+        job.cpu_arch = Some("arm64".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4");
+        assert_eq!(placement.machine_family, "c4a");
+        assert_eq!(placement.arch, "arm64");
+    }
+
+    /// Rows written before the trigger could ask for an architecture.
+    #[test]
+    fn placement_accepts_the_legacy_x86_64_alias() {
+        let mut job = test_job();
+        job.cpu_arch = Some("x86_64".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.machine_family, "c4");
+        assert_eq!(placement.arch, "amd64");
     }
 
     #[test]

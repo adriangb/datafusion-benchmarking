@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use crate::resources::PodResources;
+
 /// Fields for inserting a new benchmark job into SQLite.
 pub struct JobInsert<'a> {
     pub comment_id: i64,
@@ -21,6 +23,9 @@ pub struct JobInsert<'a> {
     pub baseline_ref: Option<&'a str>,
     pub changed_ref: Option<&'a str>,
     pub job_type: &'a str,
+    /// Pod sizing asked for by the trigger comment. Each `None` field falls
+    /// back to the controller default when the pod is built.
+    pub resources: &'a PodResources,
 }
 
 /// SQLite row for a benchmark job. Status follows this state machine:
@@ -62,7 +67,7 @@ pub struct BenchmarkJob {
 
 /// Parsed user intent from a PR comment (e.g. `run benchmark tpch_mem`).
 /// Empty `benchmarks` means "run the default suite".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BenchmarkRequest {
     pub benchmarks: Vec<String>,
     pub env_vars: HashMap<String, String>,
@@ -70,6 +75,7 @@ pub struct BenchmarkRequest {
     pub changed_env_vars: HashMap<String, String>,
     pub baseline_ref: Option<String>,
     pub changed_ref: Option<String>,
+    pub resources: PodResources,
 }
 
 /// Benchmark runner variant.
