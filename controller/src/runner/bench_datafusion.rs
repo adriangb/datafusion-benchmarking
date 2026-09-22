@@ -591,7 +591,6 @@ fn shell_side_env_args(
     let mut args: Vec<String> = vec![
         format!("DATAFUSION_DIR={}", side_dir.display()),
         format!("RESULTS_NAME={results_name}"),
-        format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
         // Suites that bench.sh runs through the Criterion SQL harness read
         // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
         // dfbench-based suites (which never read it) and saves a named
@@ -599,10 +598,31 @@ fn shell_side_env_args(
         format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
     ];
     args.extend(extra_env.iter().cloned());
+    // After `extra_env`, so a trigger cannot move the spill files away from
+    // the directory the monitor samples.
+    args.push(spill_tmpdir_arg(spill_dir));
     // Also overrides the trigger's shared `env:` block, which the runner
     // inherits from the pod.
     args.extend(build_env::args());
     args
+}
+
+/// `TMPDIR=<spill_dir>` for the benchmark process, so its spill files land in
+/// the directory the monitor samples for "Peak spill".
+///
+/// dfbench and the Criterion SQL harness build their runtime with
+/// `DiskManagerBuilder::default()`, which creates its spill directory under
+/// `std::env::temp_dir()`, that is `$TMPDIR` or `/tmp`. No DataFusion binary
+/// reads a `DATAFUSION_RUNTIME_TEMP_DIRECTORY` env var (runtime settings are
+/// not part of `ConfigOptions::from_env`), so `TMPDIR` is the only knob that
+/// works for every binary `bench.sh` starts.
+///
+/// Compilers that run inside the monitored command (`cargo bench --bench sql`)
+/// also write to `$TMPDIR`. The monitor only counts DataFusion's own spill
+/// directories, so that does not inflate the figure (see
+/// `monitor::spill_size`).
+fn spill_tmpdir_arg(spill_dir: &Path) -> String {
+    format!("TMPDIR={}", spill_dir.display())
 }
 
 /// Map a TPC-H bench name to (dfbench tpch args, results JSON filename).
@@ -668,11 +688,8 @@ async fn run_tpch_direct(
         .ok_or_else(|| anyhow::anyhow!("missing --scale-factor in tpch args"))?;
     let data_path = bench_benchmarks.join(format!("data/tpch_sf{sf}"));
 
-    let mut env_args: Vec<String> = vec![format!(
-        "DATAFUSION_RUNTIME_TEMP_DIRECTORY={}",
-        spill_dir.display()
-    )];
-    env_args.extend(extra_env.iter().cloned());
+    let mut env_args: Vec<String> = extra_env.to_vec();
+    env_args.push(spill_tmpdir_arg(spill_dir));
     env_args.push(dfbench.to_string_lossy().into_owned());
     env_args.extend(tpch_args);
     env_args.extend([
@@ -1120,6 +1137,22 @@ mod tests {
         assert_eq!(
             last_assignment(&args, "DATAFUSION_RUNTIME_MEMORY_LIMIT").as_deref(),
             Some("2G")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_points_tmpdir_at_spill_dir() {
+        // A trigger's TMPDIR must not move spill files away from the
+        // directory the monitor samples.
+        let args = side_env(&["TMPDIR=/elsewhere"]);
+        assert_eq!(
+            last_assignment(&args, "TMPDIR").as_deref(),
+            Some("/workspace/spill")
+        );
+        // Nothing reads this var, so the runner no longer sets it.
+        assert_eq!(
+            last_assignment(&args, "DATAFUSION_RUNTIME_TEMP_DIRECTORY"),
+            None
         );
     }
 
