@@ -66,8 +66,9 @@ pub async fn insert_job(pool: &SqlitePool, job: &JobInsert<'_>) -> Result<i64> {
     let result = sqlx::query(
         "INSERT INTO benchmark_jobs \
          (comment_id, repo, pr_number, pr_url, login, benchmarks, env_vars, \
-          baseline_env_vars, changed_env_vars, baseline_ref, changed_ref, job_type) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          baseline_env_vars, changed_env_vars, baseline_ref, changed_ref, job_type, \
+          cpu_request, memory_request, cpu_arch) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.comment_id)
     .bind(job.repo)
@@ -81,6 +82,9 @@ pub async fn insert_job(pool: &SqlitePool, job: &JobInsert<'_>) -> Result<i64> {
     .bind(job.baseline_ref)
     .bind(job.changed_ref)
     .bind(job.job_type)
+    .bind(job.resources.cpu.as_deref())
+    .bind(job.resources.memory.as_deref())
+    .bind(job.resources.arch.as_deref())
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
@@ -253,6 +257,7 @@ pub async fn get_queue_summary(pool: &SqlitePool) -> Result<Vec<BenchmarkJob>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::PodResources;
 
     async fn test_pool() -> SqlitePool {
         connect("sqlite::memory:").await.unwrap()
@@ -272,8 +277,16 @@ mod tests {
             baseline_ref: None,
             changed_ref: None,
             job_type: "standard",
+            resources: &NO_RESOURCES,
         }
     }
+
+    /// A job whose pod sizing is left entirely to the controller defaults.
+    static NO_RESOURCES: PodResources = PodResources {
+        cpu: None,
+        memory: None,
+        arch: None,
+    };
 
     // ── mark_comment_seen + is_comment_seen ─────────────────────────
 
@@ -327,6 +340,46 @@ mod tests {
         }
         let pending = get_pending_jobs(&pool).await.unwrap();
         assert_eq!(pending.len(), 5);
+    }
+
+    /// The pod sizing a trigger asked for has to survive the insert, or the
+    /// pod builder silently falls back to the controller defaults.
+    #[tokio::test]
+    async fn insert_stores_the_requested_resources() {
+        let pool = test_pool().await;
+        mark_comment_seen(&pool, 150, "apache/datafusion", 42, "alice", "2024-01-01")
+            .await
+            .unwrap();
+
+        let resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
+        let mut job = test_job(150);
+        job.resources = &resources;
+        insert_job(&pool, &job).await.unwrap();
+
+        let pending = get_pending_jobs(&pool).await.unwrap();
+        assert_eq!(pending[0].cpu_request.as_deref(), Some("16"));
+        assert_eq!(pending[0].memory_request.as_deref(), Some("128Gi"));
+        assert_eq!(pending[0].cpu_arch.as_deref(), Some("amd64"));
+    }
+
+    /// An unconfigured job leaves the columns NULL so the pod builder uses the
+    /// controller defaults.
+    #[tokio::test]
+    async fn insert_leaves_unrequested_resources_null() {
+        let pool = test_pool().await;
+        mark_comment_seen(&pool, 160, "apache/datafusion", 42, "alice", "2024-01-01")
+            .await
+            .unwrap();
+        insert_job(&pool, &test_job(160)).await.unwrap();
+
+        let pending = get_pending_jobs(&pool).await.unwrap();
+        assert!(pending[0].cpu_request.is_none());
+        assert!(pending[0].memory_request.is_none());
+        assert!(pending[0].cpu_arch.is_none());
     }
 
     // ── get_pending_jobs: per-user running-cap filter ─────────────

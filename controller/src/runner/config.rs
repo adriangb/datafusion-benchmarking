@@ -4,7 +4,8 @@
 //! `job_manager.rs`): `PR_URL`, `COMMENT_ID`, `BENCHMARKS`, `BENCH_TYPE`,
 //! `BENCH_NAME`, `BENCH_FILTER`, `REPO`, `JOB_ID`, `RUNNER_TOKEN`,
 //! `CONTROLLER_URL`, `RUNNER_REPO_URL`, `SHARED_ENV_VARS`,
-//! `BASELINE_ENV_VARS`, `CHANGED_ENV_VARS`. The scheduled main-tracking
+//! `BASELINE_ENV_VARS`, `CHANGED_ENV_VARS`, `REQUESTED_CPU`,
+//! `REQUESTED_MEMORY`, `REQUESTED_ARCH`. The scheduled main-tracking
 //! workflow instead supplies `GITHUB_TOKEN` directly (no PR author to
 //! distrust).
 
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 
 use crate::github::GitHubClient;
+use crate::resources::PodResources;
 use crate::runner::controller_client::ControllerClient;
 use crate::runner::poster::CommentPoster;
 
@@ -78,6 +80,10 @@ pub struct RunnerConfig {
     pub changed_ref: Option<String>,
     /// URL of the benchmark runner's own GitHub repo (for "file an issue" links).
     pub runner_repo_url: Option<String>,
+    /// Pod sizing the trigger comment asked for. Set only for the fields the
+    /// trigger named, so comments can report the request rather than the
+    /// defaults it left alone.
+    pub resources: PodResources,
 }
 
 impl RunnerConfig {
@@ -119,6 +125,11 @@ impl RunnerConfig {
             baseline_ref: std::env::var("BASELINE_REF").ok(),
             changed_ref: std::env::var("CHANGED_REF").ok(),
             runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
+            resources: PodResources {
+                cpu: std::env::var("REQUESTED_CPU").ok(),
+                memory: std::env::var("REQUESTED_MEMORY").ok(),
+                arch: std::env::var("REQUESTED_ARCH").ok(),
+            },
         })
     }
 

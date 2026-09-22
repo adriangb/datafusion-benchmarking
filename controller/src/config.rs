@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::models::JobType;
+use crate::resources::{ResourceLimits, DEFAULT_MAX_CPU, DEFAULT_MAX_MEMORY};
 
 /// Maximum benchmark jobs a single user can have in the `running` state at once.
 /// Enforced at pickup in `db::get_pending_jobs`, so pending jobs sit in the
@@ -77,6 +78,8 @@ pub struct BenchmarkConfig {
 /// ACTIVE_DEADLINE_SECS      7200                                  no
 /// TTL_AFTER_FINISHED_SECS   3600                                  no
 /// DEFAULT_MACHINE_FAMILY    c4a                                   no
+/// MAX_CPU                   72                                    no
+/// MAX_MEMORY                576Gi                                 no
 /// STORAGE_CLASS             hyperdisk-balanced                    no
 /// SCCACHE_GCS_BUCKET        —                                     no
 /// DATA_CACHE_BUCKET          —                                     no
@@ -97,6 +100,8 @@ pub struct Config {
     pub ephemeral_storage: String,
     /// Default GCE machine family for benchmark pods (`"c4a"` for ARM, `"c4"` for x86).
     pub default_machine_family: String,
+    /// Caps on the pod size a trigger comment may ask for.
+    pub resource_limits: ResourceLimits,
     /// Maximum wall-clock seconds a K8s Job may run before being killed.
     pub active_deadline_secs: i64,
     /// Seconds after completion before the K8s Job object is garbage-collected.
@@ -131,6 +136,12 @@ impl Config {
             default_memory: env_or("DEFAULT_MEMORY", "65Gi"),
             ephemeral_storage: env_or("EPHEMERAL_STORAGE", "128Gi"),
             default_machine_family: env_or("DEFAULT_MACHINE_FAMILY", "c4a"),
+            resource_limits: ResourceLimits::new(
+                &env_or("MAX_CPU", DEFAULT_MAX_CPU),
+                &env_or("MAX_MEMORY", DEFAULT_MAX_MEMORY),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("MAX_CPU / MAX_MEMORY")?,
             active_deadline_secs: env_or("ACTIVE_DEADLINE_SECS", "7200")
                 .parse()
                 .context("ACTIVE_DEADLINE_SECS")?,

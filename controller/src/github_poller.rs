@@ -12,10 +12,11 @@ use crate::benchmarks::{
     allowed_users_markdown, detect_benchmark, is_benchmark_trigger, is_queue_request,
     is_singular_no_names, usage_message, DetectResult,
 };
-use crate::config::{BenchmarkConfig, Config, RepoEntry, MAX_QUEUED_PER_USER};
+use crate::config::{Config, RepoEntry, MAX_QUEUED_PER_USER};
 use crate::db;
 use crate::github::{self, GitHubClient};
 use crate::models::{GitHubComment, JobInsert};
+use crate::resources::PodResources;
 
 /// Infinite loop that polls GitHub for new PR comments on each watched repo.
 ///
@@ -41,16 +42,7 @@ pub async fn poll_loop(
     let interval = tokio::time::Duration::from_secs(config.poll_interval_secs);
     loop {
         for repo in config.benchmark_config.repos.keys() {
-            if let Err(e) = poll_repo(
-                &pool,
-                &gh,
-                &config.benchmark_config,
-                repo,
-                config.poll_interval_secs,
-                config.runner_repo_url.as_deref(),
-            )
-            .await
-            {
+            if let Err(e) = poll_repo(&pool, &gh, &config, repo).await {
                 warn!(repo, error = ?e, "poll error");
             }
         }
@@ -65,16 +57,14 @@ pub async fn poll_loop(
 }
 
 /// Fetch and process recent comments for a single repo.
-#[tracing::instrument(skip(pool, gh, bench_cfg, poll_interval_secs, runner_repo_url))]
+#[tracing::instrument(skip(pool, gh, config))]
 async fn poll_repo(
     pool: &SqlitePool,
     gh: &GitHubClient,
-    bench_cfg: &BenchmarkConfig,
+    config: &Config,
     repo: &str,
-    poll_interval_secs: u64,
-    runner_repo_url: Option<&str>,
 ) -> Result<()> {
-    let repo_entry = match bench_cfg.repos.get(repo) {
+    let repo_entry = match config.benchmark_config.repos.get(repo) {
         Some(e) => e,
         None => {
             warn!(repo, "unknown repo, skipping");
@@ -94,24 +84,14 @@ async fn poll_repo(
     info!(repo, count = comments.len(), "fetched comments");
 
     for comment in &comments {
-        if let Err(e) = process_comment(
-            pool,
-            gh,
-            bench_cfg,
-            repo,
-            repo_entry,
-            comment,
-            runner_repo_url,
-        )
-        .await
-        {
+        if let Err(e) = process_comment(pool, gh, config, repo, repo_entry, comment).await {
             warn!(comment_id = comment.id, error = ?e, "process comment error");
         }
     }
 
     // Store a scan timestamp that overlaps by 2 poll intervals so restarts
     // don't miss comments. The seen_comments table deduplicates processing.
-    let overlap = Utc::now() - Duration::seconds((poll_interval_secs * 2) as i64);
+    let overlap = Utc::now() - Duration::seconds((config.poll_interval_secs * 2) as i64);
     let scan_ts = overlap.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     db::set_last_scan(pool, repo, &scan_ts).await?;
 
@@ -156,11 +136,10 @@ fn rate_limit_message(
 async fn process_comment(
     pool: &SqlitePool,
     gh: &GitHubClient,
-    bench_cfg: &BenchmarkConfig,
+    config: &Config,
     repo: &str,
     repo_entry: &RepoEntry,
     comment: &GitHubComment,
-    runner_repo_url: Option<&str>,
 ) -> Result<()> {
     if db::is_comment_seen(pool, comment.id).await? {
         return Ok(());
@@ -170,6 +149,7 @@ async fn process_comment(
     let login = comment.login();
     let comment_url = comment.url();
     let issue_url = comment.issue_url_str();
+    let runner_repo_url = config.runner_repo_url.as_deref();
     let footer = github::issues_footer(runner_repo_url);
 
     let Some(pr_number) = pr_number_from_url(issue_url) else {
@@ -208,11 +188,11 @@ async fn process_comment(
     }
 
     // Try to detect benchmark trigger
-    let request = match detect_benchmark(body) {
+    let request = match detect_benchmark(body, &config.resource_limits) {
         DetectResult::Parsed(req) => req,
         DetectResult::ConfigError(err) => {
             // YAML config was present but invalid — post a helpful error
-            if bench_cfg.allowed_users.contains(login) {
+            if config.benchmark_config.allowed_users.contains(login) {
                 let msg = format!(
                     "Hi @{login}, your benchmark configuration could not be parsed ({comment_url}).\n\n\
                      **Error:** `{err}`\n\n{}{footer}",
@@ -228,11 +208,11 @@ async fn process_comment(
             // only `None` cases that look like a trigger are `run benchmark`
             // (singular) with no names.
             if is_benchmark_trigger(body) {
-                if !bench_cfg.allowed_users.contains(login) {
+                if !config.benchmark_config.allowed_users.contains(login) {
                     let msg = not_allowed_message(
                         login,
                         comment_url,
-                        &bench_cfg.allowed_users,
+                        &config.benchmark_config.allowed_users,
                         runner_repo_url,
                     );
                     gh.post_comment(repo, pr_number, &msg).await?;
@@ -255,11 +235,11 @@ async fn process_comment(
     };
 
     // User must be allowed — mark seen only after reply succeeds.
-    if !bench_cfg.allowed_users.contains(login) {
+    if !config.benchmark_config.allowed_users.contains(login) {
         let msg = not_allowed_message(
             login,
             comment_url,
-            &bench_cfg.allowed_users,
+            &config.benchmark_config.allowed_users,
             runner_repo_url,
         );
         gh.post_comment(repo, pr_number, &msg).await?;
@@ -318,6 +298,7 @@ async fn process_comment(
                 baseline_ref: request.baseline_ref.as_deref(),
                 changed_ref: request.changed_ref.as_deref(),
                 job_type,
+                resources: &request.resources,
             },
         )
         .await?;
@@ -340,6 +321,7 @@ async fn process_comment(
                     baseline_ref: request.baseline_ref.as_deref(),
                     changed_ref: request.changed_ref.as_deref(),
                     job_type,
+                    resources: &request.resources,
                 },
             )
             .await?;
@@ -363,6 +345,17 @@ fn pr_number_from_url(url: &str) -> Option<i64> {
         .and_then(|s| s.parse().ok())
 }
 
+/// The pod sizing a queued job asked for, or `None` when it takes every
+/// controller default.
+fn job_resources(job: &crate::models::BenchmarkJob) -> Option<String> {
+    PodResources {
+        cpu: job.cpu_request.clone(),
+        memory: job.memory_request.clone(),
+        arch: job.cpu_arch.clone(),
+    }
+    .summary()
+}
+
 /// Build a markdown table of pending/active jobs for a "show benchmark queue" reply.
 fn format_queue_message(
     login: &str,
@@ -376,16 +369,40 @@ fn format_queue_message(
     if jobs.is_empty() {
         lines.push("No pending jobs.".to_string());
     } else {
-        lines.push("| Comment | Repo | PR | User | Benchmarks | Status |".to_string());
-        lines.push("| --- | --- | --- | --- | --- | --- |".to_string());
+        // A Resources column is dead weight on a queue of default-sized pods,
+        // so it appears only once a job in the queue asked for something.
+        let show_resources = jobs.iter().any(|job| job_resources(job).is_some());
+        let resources_header = if show_resources { " Resources |" } else { "" };
+        let resources_divider = if show_resources { " --- |" } else { "" };
+
+        lines.push(format!(
+            "| Comment | Repo | PR | User | Benchmarks |{resources_header} Status |"
+        ));
+        lines.push(format!(
+            "| --- | --- | --- | --- | --- |{resources_divider} --- |"
+        ));
         for job in jobs {
             let comment_link = format!(
                 "[#{}]({}#issuecomment-{})",
                 job.comment_id, job.pr_url, job.comment_id
             );
+            let resources = if show_resources {
+                format!(
+                    " {} |",
+                    job_resources(job).unwrap_or_else(|| "default".into())
+                )
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "| {} | {} | #{} | {} | {} | {} |",
-                comment_link, job.repo, job.pr_number, job.login, job.benchmarks, job.status
+                "| {} | {} | #{} | {} | {} |{} {} |",
+                comment_link,
+                job.repo,
+                job.pr_number,
+                job.login,
+                job.benchmarks,
+                resources,
+                job.status
             ));
         }
     }
@@ -457,9 +474,8 @@ mod tests {
         assert!(msg.contains("No pending jobs."));
     }
 
-    #[test]
-    fn format_queue_with_jobs() {
-        let job = BenchmarkJob {
+    fn test_job() -> BenchmarkJob {
+        BenchmarkJob {
             id: 1,
             comment_id: 100,
             repo: "apache/datafusion".to_string(),
@@ -482,13 +498,40 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             runner_token: None,
-        };
-        let msg = format_queue_message("bob", "https://example.com/c/2", &[job]);
+        }
+    }
+
+    #[test]
+    fn format_queue_with_jobs() {
+        let msg = format_queue_message("bob", "https://example.com/c/2", &[test_job()]);
         assert!(msg.contains("| Comment |"));
         assert!(
             msg.contains("[#100](https://github.com/apache/datafusion/pull/42#issuecomment-100)")
         );
         assert!(msg.contains("apache/datafusion"));
         assert!(msg.contains("#42"));
+    }
+
+    /// A queue of default-sized pods has nothing to say about resources.
+    #[test]
+    fn format_queue_omits_the_resources_column_by_default() {
+        let msg = format_queue_message("bob", "https://example.com/c/2", &[test_job()]);
+        assert!(!msg.contains("Resources"));
+    }
+
+    #[test]
+    fn format_queue_shows_the_requested_resources() {
+        let mut custom = test_job();
+        custom.id = 2;
+        custom.cpu_request = Some("16".into());
+        custom.memory_request = Some("128Gi".into());
+        custom.cpu_arch = Some("amd64".into());
+
+        let msg = format_queue_message("bob", "https://example.com/c/2", &[test_job(), custom]);
+
+        assert!(msg.contains("| Benchmarks | Resources | Status |"));
+        assert!(msg.contains("| 16 CPU, 128Gi, amd64 | pending |"));
+        // The unconfigured job still fills the column.
+        assert!(msg.contains("| default | pending |"));
     }
 }
