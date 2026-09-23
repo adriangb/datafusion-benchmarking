@@ -17,13 +17,31 @@
 //!   is omitted. That is the default for runs triggered here.
 //! * The side predates #23985 — e.g. a `baseline: ref: v45.0.0` comparison.
 //!
+//! Separately, some benchmarks write no results JSON at all, so there is no
+//! file to read the field from, with or without a memory limit. These are the
+//! Criterion-based ones: Criterion `[[bench]]` targets, and the suites that
+//! `bench.sh` runs through the Criterion SQL harness (`cargo bench --bench
+//! sql`, e.g. `wide_schema`, `predicate_eval`). DataFusion's Criterion path
+//! prints its memory stats to stdout only. When the trigger asked for a memory
+//! limit, the section names these benchmarks in a note, so that "no data" does
+//! not read as "not supported" or the other way around. Without a limit, they
+//! are left out silently, like everything else.
+//!
+//! The runner detects them by what the invocation produced, not by name: a
+//! requested benchmark that left no results JSON on either side is one. The
+//! missing file is the actual reason there is no data, and `bench.sh` can move
+//! a suite between `dfbench` and the SQL harness (`tpch` has both paths), so a
+//! list of names would go stale. The only `bench.sh` suite that writes no
+//! results JSON and is not Criterion-based is `compile_profile`, which measures
+//! build time and has no queries to record peaks for.
+//!
 //! The run-wide counterpart is [`monitor`](super::monitor), which samples peak
 //! RSS from the benchmark's process subtree. The two are paired per *benchmark
 //! invocation*, not per query: `pool_peak_bytes` is scoped to one query while
 //! the RSS sample covers the whole invocation, so the only defensible pairing
 //! is the largest per-query peak in a run against that run's peak RSS.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use tracing::warn;
@@ -62,6 +80,41 @@ impl BenchPeaks {
 /// Whether any query on this side reported a peak at all.
 fn any_data(peaks: &[BenchPeaks]) -> bool {
     peaks.iter().any(|b| b.max_pool_peak().is_some())
+}
+
+/// The env var that makes DataFusion install the pool that records peaks.
+const MEMORY_LIMIT_ENV: &str = "DATAFUSION_RUNTIME_MEMORY_LIMIT";
+
+/// Whether the trigger set [`MEMORY_LIMIT_ENV`] in any of the given env blocks
+/// (the shared `env:` block or a per-side one). An empty value does not count.
+pub fn memory_limit_requested<'a>(
+    envs: impl IntoIterator<Item = &'a HashMap<String, String>>,
+) -> bool {
+    envs.into_iter().any(|env| {
+        env.get(MEMORY_LIMIT_ENV)
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+}
+
+/// Requested benchmarks that left no results JSON on either side, in request
+/// order. See the module docs for why this identifies the Criterion-based ones.
+fn benches_without_results(
+    requested: &[String],
+    base: &[BenchPeaks],
+    changed: &[BenchPeaks],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    requested
+        .iter()
+        .filter(|bench| {
+            !base
+                .iter()
+                .chain(changed.iter())
+                .any(|p| &p.bench == *bench)
+        })
+        .filter(|bench| seen.insert(bench.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Extract the per-query peaks from a DataFusion benchmark results JSON.
@@ -151,12 +204,21 @@ pub async fn collect_new(dir: &Path, before: &BTreeSet<String>, bench: &str) -> 
 
 /// Render the peak-pool section for the PR comment.
 ///
-/// Returns an empty string when neither side reported a single peak, so a
-/// default run — which sets no memory limit and therefore records nothing —
-/// leaves the comment exactly as it was before this section existed.
+/// `requested` is every benchmark the run was asked for, and
+/// `limit_requested` is whether the trigger set a memory limit (see
+/// [`memory_limit_requested`]).
+///
+/// Returns an empty string when neither side reported a single peak and there
+/// is nothing to explain, so a default run — which sets no memory limit and
+/// therefore records nothing — leaves the comment exactly as it was before this
+/// section existed. When a limit was requested, a benchmark that wrote no
+/// results JSON gets a note instead of disappearing without a word.
+#[allow(clippy::too_many_arguments)]
 pub fn format_pool_peak_section(
     base_label: &str,
     changed_label: &str,
+    requested: &[String],
+    limit_requested: bool,
     base: &[BenchPeaks],
     changed: &[BenchPeaks],
     base_stats: &[(String, ResourceStats)],
@@ -164,16 +226,29 @@ pub fn format_pool_peak_section(
 ) -> String {
     let base_has = any_data(base);
     let changed_has = any_data(changed);
-    if !base_has && !changed_has {
+    let unavailable_note = if limit_requested {
+        no_results_note(&benches_without_results(requested, base, changed))
+    } else {
+        String::new()
+    };
+    if !base_has && !changed_has && unavailable_note.is_empty() {
         return String::new();
     }
 
     let mut out = format!(
         "Peak `MemoryPool` reservation per query — what DataFusion's accounting \
-         believes it reserved. Recorded only when the benchmark runs with \
+         believes it reserved. Recorded only for benchmarks that write a results \
+         JSON (the `dfbench` suites), and only when they run with \
          `DATAFUSION_RUNTIME_MEMORY_LIMIT` set.\n\n\
          Base: `{base_label}` | Changed: `{changed_label}`\n\n"
     );
+
+    if !base_has && !changed_has {
+        // Only the note to show: every benchmark that wrote a results JSON
+        // (if any) recorded nothing, so its table would be all `n/a`.
+        out.push_str(&unavailable_note);
+        return out;
+    }
 
     if !base_has {
         out.push_str(&missing_side_note("Base", base_label));
@@ -181,6 +256,7 @@ pub fn format_pool_peak_section(
     if !changed_has {
         out.push_str(&missing_side_note("Changed", changed_label));
     }
+    out.push_str(&unavailable_note);
 
     for source in sources_in_order(base, changed) {
         let b = base.iter().find(|p| p.source == source);
@@ -207,6 +283,30 @@ fn missing_side_note(side: &str, label: &str) -> String {
     format!(
         "> {side} (`{label}`) reported no `pool_peak_bytes`: it ran without a memory \
          limit, or predates apache/datafusion#23985.\n\n"
+    )
+}
+
+/// Why `benches` have no rows: they wrote no results JSON. Empty when
+/// `benches` is empty.
+fn no_results_note(benches: &[String]) -> String {
+    if benches.is_empty() {
+        return String::new();
+    }
+    let names = benches
+        .iter()
+        .map(|b| format!("`{b}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (it, runs) = if benches.len() == 1 {
+        ("it", "runs")
+    } else {
+        ("they", "run")
+    };
+    format!(
+        "> Pool peaks are not available for {names}: {it} {runs} through Criterion \
+         (a Criterion bench target, or the SQL harness `cargo bench --bench sql` \
+         that `bench.sh` uses for some suites), which does not write per-query \
+         pool peaks.\n\n"
     )
 }
 
@@ -428,6 +528,122 @@ mod tests {
         }
     }
 
+    fn names(benches: &[&str]) -> Vec<String> {
+        benches.iter().map(|b| b.to_string()).collect()
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn memory_limit_requested_checks_every_env_block() {
+        let empty = HashMap::new();
+        let limit = env(&[(MEMORY_LIMIT_ENV, "512M")]);
+        let other = env(&[("RUST_LOG", "debug")]);
+        let blank = env(&[(MEMORY_LIMIT_ENV, " ")]);
+        assert!(!memory_limit_requested([&empty, &other, &empty]));
+        assert!(!memory_limit_requested([&blank]));
+        // Shared block, or either per-side block.
+        assert!(memory_limit_requested([&limit, &empty, &empty]));
+        assert!(memory_limit_requested([&empty, &empty, &limit]));
+    }
+
+    #[test]
+    fn criterion_bench_with_limit_gets_a_note() {
+        // `spill_views` through the SQL harness: no results JSON on either side.
+        let section = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["spill_views"]),
+            true,
+            &[],
+            &[],
+            &[("spill_views".into(), stats(1 << 30))],
+            &[("spill_views".into(), stats(1 << 30))],
+        );
+        assert!(section.contains(
+            "> Pool peaks are not available for `spill_views`: it runs through Criterion"
+        ));
+        // Neither the per-side "no pool_peak_bytes" notes nor empty tables:
+        // those describe a results JSON that lacks the field.
+        assert!(!section.contains("reported no `pool_peak_bytes`"));
+        assert!(!section.contains("| Query |"));
+        assert!(!section.contains("Pool accounting vs. process RSS"));
+    }
+
+    #[test]
+    fn criterion_bench_without_limit_renders_nothing() {
+        let section = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["spill_views", "wide_schema"]),
+            false,
+            &[],
+            &[],
+            &[("spill_views".into(), stats(1 << 30))],
+            &[("spill_views".into(), stats(1 << 30))],
+        );
+        assert_eq!(section, "");
+    }
+
+    #[test]
+    fn data_present_renders_the_table_as_before() {
+        let base = vec![peaks("tpch", "tpch_sf1", &[("1", Some(1024))])];
+        let changed = vec![peaks("tpch", "tpch_sf1", &[("1", Some(2048))])];
+        let base_stats = [("tpch".into(), stats(4096))];
+        let changed_stats = [("tpch".into(), stats(4096))];
+        let with_limit = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["tpch"]),
+            true,
+            &base,
+            &changed,
+            &base_stats,
+            &changed_stats,
+        );
+        let without = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &[],
+            false,
+            &base,
+            &changed,
+            &base_stats,
+            &changed_stats,
+        );
+        // A benchmark that wrote its results JSON gets no note, so the section
+        // is exactly what it was before the note existed.
+        assert_eq!(with_limit, without);
+        assert!(!with_limit.contains("not available"));
+        assert!(with_limit.contains("| 1 | 1.0 KiB | 2.0 KiB | +100.0% |"));
+    }
+
+    #[test]
+    fn mixed_run_keeps_the_table_and_notes_the_criterion_benches() {
+        let base = vec![peaks("tpch", "tpch_sf1", &[("1", Some(1024))])];
+        let changed = vec![peaks("tpch", "tpch_sf1", &[("1", Some(2048))])];
+        let section = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["tpch", "spill_views", "wide_schema"]),
+            true,
+            &base,
+            &changed,
+            &[],
+            &[],
+        );
+        assert!(section.contains("| 1 | 1.0 KiB | 2.0 KiB | +100.0% |"));
+        assert!(section.contains(
+            "> Pool peaks are not available for `spill_views`, `wide_schema`: they run through Criterion"
+        ));
+        assert!(!section.contains("`tpch`, "));
+    }
+
     #[test]
     fn parses_pool_peak_when_present() {
         let json = r#"{
@@ -483,6 +699,8 @@ mod tests {
         let section = format_pool_peak_section(
             "abc1234",
             "my-branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(1 << 30))],
@@ -499,6 +717,8 @@ mod tests {
         let section = format_pool_peak_section(
             "v45.0.0",
             "main",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(2048))],
@@ -524,6 +744,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(4096))],
@@ -540,6 +762,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("nlj".into(), stats(8192))],
@@ -569,6 +793,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(8 << 20))],
@@ -597,6 +823,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &[],
             &[("h2o".into(), stats(8192))],
@@ -612,7 +840,8 @@ mod tests {
     #[test]
     fn missing_resource_stats_drop_only_the_rss_row() {
         let base = vec![peaks("tpch", "tpch_sf1", &[("1", Some(1024))])];
-        let section = format_pool_peak_section("base-sha", "branch", &base, &[], &[], &[]);
+        let section =
+            format_pool_peak_section("base-sha", "branch", &[], false, &base, &[], &[], &[]);
         // Per-query table still renders.
         assert!(section.contains("| 1 | 1.0 KiB | n/a | n/a |"));
         // The pairing table is omitted entirely rather than showing empty rows.

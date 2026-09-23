@@ -228,6 +228,8 @@ Without a limit nothing is recorded, and the section is omitted rather than
 reported as zero. The same applies per side — comparing against a baseline that
 predates #23985 renders that column as `n/a` with a note saying why.
 
+Only benchmarks that write a results JSON (the `dfbench` suites) have pool peaks. Criterion-based benchmarks do not: Criterion bench targets, and the suites that `bench.sh` runs through the Criterion SQL harness (`cargo bench --bench sql`, e.g. `spill_views`, `wide_schema`, `predicate_eval`). DataFusion's Criterion path prints memory stats to stdout and writes no per-query pool peaks. When you set a memory limit, the section names these benchmarks in a note, so you can tell "not available for this benchmark" from "nothing recorded". The runner identifies them by the missing results JSON, not by a list of names.
+
 This is measurement only. Nothing asserts a relationship between what the pool
 accounts for and what the process actually allocates; operators deliberately
 leave in-flight batches untracked, so the gap between the two is expected and is
@@ -306,7 +308,7 @@ controller/                Rust controller crate
   migrations/              SQLite schema
     runner/
       monitor.rs           Peak/avg RSS, CPU and spill sampling per benchmark invocation
-      pool_peak.rs         Per-query `pool_peak_bytes` from the results JSON
+      pool_peak.rs         Per-query `pool_peak_bytes` from the results JSON (dfbench suites only)
 runner/                    Benchmark runner container (builds project, runs benchmarks, posts results)
 queries/                   SQL query files for ClickBench
 scripts/                   Legacy benchmark scripts (reference)
