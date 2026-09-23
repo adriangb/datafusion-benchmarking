@@ -19,8 +19,11 @@
 //!
 //! `compare_detail` reports wall time only, so the same `results/<side>/*.json`
 //! are additionally read here for `pool_peak_bytes` — see
-//! [`pool_peak`](super::pool_peak). Criterion runs write no such JSON, so they
-//! have no pool peaks.
+//! [`pool_peak`](super::pool_peak). The Criterion SQL harness writes the same
+//! JSON, without timings, to `results/<side>/criterion/`, which
+//! `compare_detail` does not read, so its suites get pool peaks without a
+//! second timing table. Criterion `[[bench]]` targets write no such JSON, so
+//! they have no pool peaks.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
