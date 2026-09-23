@@ -19,7 +19,11 @@
 //!
 //! `compare_detail` reports wall time only, so the same `results/<side>/*.json`
 //! are additionally read here for `pool_peak_bytes` — see
-//! [`pool_peak`](super::pool_peak).
+//! [`pool_peak`](super::pool_peak). The Criterion SQL harness writes the same
+//! JSON, without timings, to `results/<side>/criterion/`, which
+//! `compare_detail` does not read, so its suites get pool peaks without a
+//! second timing table. Criterion `[[bench]]` targets write no such JSON, so
+//! they have no pool peaks.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -376,9 +380,16 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     }
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
+    let limit_requested = pool_peak::memory_limit_requested([
+        &config.shared_env_vars,
+        &config.baseline_env_vars,
+        &config.changed_env_vars,
+    ]);
     let pool_section = pool_peak::format_pool_peak_section(
         &baseline_label,
         changed_display,
+        &requested,
+        limit_requested,
         &base_peaks,
         &branch_peaks,
         &base_stats_list,
@@ -849,10 +860,12 @@ fn format_resource_section(
 /// the "running" comment opened with — so the result stands on its own instead
 /// of only linking back to the trigger.
 ///
-/// `pool_section` is empty whenever no side recorded a `pool_peak_bytes` — the
-/// default, since runs set no memory limit unless the trigger comment asks for
-/// one. Its `<details>` block is then omitted entirely, leaving the comment as
-/// it was before the section existed.
+/// `pool_section` is empty whenever no side recorded a `pool_peak_bytes` and
+/// there is nothing to explain — the default, since runs set no memory limit
+/// unless the trigger comment asks for one. Its `<details>` block is then
+/// omitted entirely, leaving the comment as it was before the section existed.
+/// With a limit set, a Criterion-based benchmark (which records no peaks) gets
+/// a note there instead of silently producing nothing.
 #[allow(clippy::too_many_arguments)]
 fn format_result_comment(
     comment_url: &str,

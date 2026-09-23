@@ -14,8 +14,35 @@
 //! * The benchmark ran without a memory limit. DataFusion installs the
 //!   recording pool only alongside a pool it has a limit for, so with no
 //!   `DATAFUSION_RUNTIME_MEMORY_LIMIT` there is nothing to record and the field
-//!   is omitted. That is the default for runs triggered here.
+//!   is omitted. That is the default for runs triggered here. A suite that sets
+//!   its own limit in SQL (`SET datafusion.runtime.memory_limit`, as
+//!   `spill_views` does) records under that limit.
 //! * The side predates #23985 — e.g. a `baseline: ref: v45.0.0` comparison.
+//!
+//! The suites that `bench.sh` runs through the Criterion SQL harness
+//! (`cargo bench --bench sql`, e.g. `spill_views`, `wide_schema`) write their
+//! results JSON to the [`CRITERION_RESULTS_SUBDIR`] of the results directory,
+//! with the same format and no timings (`critcmp` reports those). The harness
+//! only does this since the DataFusion change in [`HARNESS_PR`]. The runner
+//! takes `bench.sh` from `main` but runs each side's own harness, so a side
+//! older than that change writes no file for these suites.
+//!
+//! Some benchmarks therefore write no results JSON at all, so there is no file
+//! to read the field from, with or without a memory limit: Criterion
+//! `[[bench]]` targets always, and the SQL-harness suites on a side that
+//! predates [`HARNESS_PR`]. When the trigger asked for a memory limit and
+//! neither side wrote a file, the section names these benchmarks in a note, so
+//! that "no data" does not read as "not supported" or the other way around.
+//! Without a limit, they are left out silently, like everything else. When only
+//! one side wrote a file, that side's column is `n/a` with a note that says so.
+//!
+//! The runner detects them by what the invocation produced, not by name: a
+//! requested benchmark that left no results JSON on a side is one. The missing
+//! file is the actual reason there is no data, and `bench.sh` can move a suite
+//! between `dfbench` and the SQL harness (`tpch` has both paths), so a list of
+//! names would go stale. The only `bench.sh` suite that writes no results JSON
+//! and is not Criterion-based is `compile_profile`, which measures build time
+//! and has no queries to record peaks for.
 //!
 //! The run-wide counterpart is [`monitor`](super::monitor), which samples peak
 //! RSS from the benchmark's process subtree. The two are paired per *benchmark
@@ -23,7 +50,7 @@
 //! the RSS sample covers the whole invocation, so the only defensible pairing
 //! is the largest per-query peak in a run against that run's peak RSS.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use tracing::warn;
@@ -64,6 +91,41 @@ fn any_data(peaks: &[BenchPeaks]) -> bool {
     peaks.iter().any(|b| b.max_pool_peak().is_some())
 }
 
+/// The env var that makes DataFusion install the pool that records peaks.
+const MEMORY_LIMIT_ENV: &str = "DATAFUSION_RUNTIME_MEMORY_LIMIT";
+
+/// Whether the trigger set [`MEMORY_LIMIT_ENV`] in any of the given env blocks
+/// (the shared `env:` block or a per-side one). An empty value does not count.
+pub fn memory_limit_requested<'a>(
+    envs: impl IntoIterator<Item = &'a HashMap<String, String>>,
+) -> bool {
+    envs.into_iter().any(|env| {
+        env.get(MEMORY_LIMIT_ENV)
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+}
+
+/// Requested benchmarks that left no results JSON on either side, in request
+/// order. See the module docs for why this identifies the Criterion-based ones.
+fn benches_without_results(
+    requested: &[String],
+    base: &[BenchPeaks],
+    changed: &[BenchPeaks],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    requested
+        .iter()
+        .filter(|bench| {
+            !base
+                .iter()
+                .chain(changed.iter())
+                .any(|p| &p.bench == *bench)
+        })
+        .filter(|bench| seen.insert(bench.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Extract the per-query peaks from a DataFusion benchmark results JSON.
 ///
 /// Returns `None` only when the file is not a results JSON at all (unparseable,
@@ -94,7 +156,16 @@ fn query_id(query: &serde_json::Value) -> String {
     }
 }
 
-/// The `*.json` file names currently in `dir`. Empty when `dir` is unreadable.
+/// Subdirectory of a side's results directory where `bench.sh` has the
+/// Criterion SQL harness write its results JSON. It is kept out of the results
+/// directory itself because `bench.sh compare` reads every `*.json` there as
+/// timing results, and these files hold no timings (Criterion keeps those, and
+/// `critcmp` reports them).
+pub const CRITERION_RESULTS_SUBDIR: &str = "criterion";
+
+/// The `*.json` files currently in `dir` and in its
+/// [`CRITERION_RESULTS_SUBDIR`], as paths relative to `dir` (`tpch_sf1.json`,
+/// `criterion/spill_views.json`). Empty when neither is readable.
 ///
 /// Taken before and after a benchmark invocation so the files it wrote can be
 /// attributed to it: the results file name does not follow the benchmark name
@@ -103,6 +174,19 @@ fn query_id(query: &serde_json::Value) -> String {
 /// directory and the tree is cleaned before the run, so within one side each
 /// invocation's files are genuinely new.
 pub async fn snapshot_json_files(dir: &Path) -> BTreeSet<String> {
+    let mut names = json_files_in(dir, "").await;
+    names.extend(
+        json_files_in(
+            &dir.join(CRITERION_RESULTS_SUBDIR),
+            &format!("{CRITERION_RESULTS_SUBDIR}/"),
+        )
+        .await,
+    );
+    names
+}
+
+/// The `*.json` file names in `dir`, each with `prefix` prepended.
+async fn json_files_in(dir: &Path, prefix: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return names;
@@ -113,7 +197,7 @@ pub async fn snapshot_json_files(dir: &Path) -> BTreeSet<String> {
             continue;
         }
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            names.insert(name.to_string());
+            names.insert(format!("{prefix}{name}"));
         }
     }
     names
@@ -140,9 +224,14 @@ pub async fn collect_new(dir: &Path, before: &BTreeSet<String>, bench: &str) -> 
             warn!("results JSON {} did not parse; skipping", path.display());
             continue;
         };
+        let source = Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name)
+            .to_string();
         out.push(BenchPeaks {
             bench: bench.to_string(),
-            source: name.trim_end_matches(".json").to_string(),
+            source,
             queries,
         });
     }
@@ -151,12 +240,21 @@ pub async fn collect_new(dir: &Path, before: &BTreeSet<String>, bench: &str) -> 
 
 /// Render the peak-pool section for the PR comment.
 ///
-/// Returns an empty string when neither side reported a single peak, so a
-/// default run — which sets no memory limit and therefore records nothing —
-/// leaves the comment exactly as it was before this section existed.
+/// `requested` is every benchmark the run was asked for, and
+/// `limit_requested` is whether the trigger set a memory limit (see
+/// [`memory_limit_requested`]).
+///
+/// Returns an empty string when neither side reported a single peak and there
+/// is nothing to explain, so a default run — which sets no memory limit and
+/// therefore records nothing — leaves the comment exactly as it was before this
+/// section existed. When a limit was requested, a benchmark that wrote no
+/// results JSON gets a note instead of disappearing without a word.
+#[allow(clippy::too_many_arguments)]
 pub fn format_pool_peak_section(
     base_label: &str,
     changed_label: &str,
+    requested: &[String],
+    limit_requested: bool,
     base: &[BenchPeaks],
     changed: &[BenchPeaks],
     base_stats: &[(String, ResourceStats)],
@@ -164,23 +262,50 @@ pub fn format_pool_peak_section(
 ) -> String {
     let base_has = any_data(base);
     let changed_has = any_data(changed);
-    if !base_has && !changed_has {
+    let unavailable_note = if limit_requested {
+        no_results_note(&benches_without_results(requested, base, changed))
+    } else {
+        String::new()
+    };
+    if !base_has && !changed_has && unavailable_note.is_empty() {
         return String::new();
     }
 
     let mut out = format!(
         "Peak `MemoryPool` reservation per query — what DataFusion's accounting \
-         believes it reserved. Recorded only when the benchmark runs with \
-         `DATAFUSION_RUNTIME_MEMORY_LIMIT` set.\n\n\
+         believes it reserved. Recorded only for benchmarks that write a results \
+         JSON (the `dfbench` suites, and the suites `bench.sh` runs through the \
+         Criterion SQL harness since {HARNESS_PR}), and only under a memory limit: \
+         `DATAFUSION_RUNTIME_MEMORY_LIMIT`, or one the suite sets itself.\n\n\
          Base: `{base_label}` | Changed: `{changed_label}`\n\n"
     );
 
-    if !base_has {
+    if !base_has && !changed_has {
+        // Only the note to show: every benchmark that wrote a results JSON
+        // (if any) recorded nothing, so its table would be all `n/a`.
+        out.push_str(&unavailable_note);
+        return out;
+    }
+
+    // A side that wrote no results JSON at all is explained per benchmark by
+    // `one_side_note` below; this note is for results JSONs without the field.
+    if !base_has && !base.is_empty() {
         out.push_str(&missing_side_note("Base", base_label));
     }
-    if !changed_has {
+    if !changed_has && !changed.is_empty() {
         out.push_str(&missing_side_note("Changed", changed_label));
     }
+    out.push_str(&one_side_note(
+        "Base",
+        base_label,
+        &benches_missing_from(changed, base),
+    ));
+    out.push_str(&one_side_note(
+        "Changed",
+        changed_label,
+        &benches_missing_from(base, changed),
+    ));
+    out.push_str(&unavailable_note);
 
     for source in sources_in_order(base, changed) {
         let b = base.iter().find(|p| p.source == source);
@@ -208,6 +333,65 @@ fn missing_side_note(side: &str, label: &str) -> String {
         "> {side} (`{label}`) reported no `pool_peak_bytes`: it ran without a memory \
          limit, or predates apache/datafusion#23985.\n\n"
     )
+}
+
+/// The DataFusion change that made the Criterion SQL harness write a results
+/// JSON. Sides older than it write none for those suites.
+const HARNESS_PR: &str = "apache/datafusion#25644";
+
+/// Why `benches` have no rows: they wrote no results JSON on either side.
+/// Empty when `benches` is empty.
+fn no_results_note(benches: &[String]) -> String {
+    if benches.is_empty() {
+        return String::new();
+    }
+    let names = code_list(benches);
+    let (it, runs) = if benches.len() == 1 {
+        ("it", "runs")
+    } else {
+        ("they", "run")
+    };
+    format!(
+        "> Pool peaks are not available for {names}: {it} {runs} through Criterion \
+         and wrote no results JSON. A Criterion bench target never writes one. The \
+         SQL harness `cargo bench --bench sql`, which `bench.sh` uses for some \
+         suites, writes one only since {HARNESS_PR}.\n\n"
+    )
+}
+
+/// Benchmarks that wrote a results JSON on the `present` side but none on the
+/// `absent` side, in `present` order.
+fn benches_missing_from(present: &[BenchPeaks], absent: &[BenchPeaks]) -> Vec<String> {
+    benches_in_order(present, &[])
+        .into_iter()
+        .filter(|bench| !absent.iter().any(|p| &p.bench == bench))
+        .collect()
+}
+
+/// Why one side's column is `n/a` for `benches`: that side wrote no results
+/// JSON for them while the other side did. Both sides run the same `bench.sh`,
+/// so the difference is the DataFusion checkout, and in practice it is a Criterion
+/// SQL harness that predates [`HARNESS_PR`] (for example, `baseline: ref:`
+/// set to an older release). Empty when `benches` is empty.
+fn one_side_note(side: &str, label: &str, benches: &[String]) -> String {
+    if benches.is_empty() {
+        return String::new();
+    }
+    format!(
+        "> {side} (`{label}`) wrote no results JSON for {}, so its column is `n/a`. \
+         For a suite that `bench.sh` runs through the Criterion SQL harness, this \
+         means that side predates {HARNESS_PR}.\n\n",
+        code_list(benches),
+    )
+}
+
+/// `a`, `b`, `c`
+fn code_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|b| format!("`{b}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Every results-file stem seen on either side, base order first.
@@ -428,6 +612,217 @@ mod tests {
         }
     }
 
+    fn names(benches: &[&str]) -> Vec<String> {
+        benches.iter().map(|b| b.to_string()).collect()
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn memory_limit_requested_checks_every_env_block() {
+        let empty = HashMap::new();
+        let limit = env(&[(MEMORY_LIMIT_ENV, "512M")]);
+        let other = env(&[("RUST_LOG", "debug")]);
+        let blank = env(&[(MEMORY_LIMIT_ENV, " ")]);
+        assert!(!memory_limit_requested([&empty, &other, &empty]));
+        assert!(!memory_limit_requested([&blank]));
+        // Shared block, or either per-side block.
+        assert!(memory_limit_requested([&limit, &empty, &empty]));
+        assert!(memory_limit_requested([&empty, &empty, &limit]));
+    }
+
+    #[test]
+    fn criterion_bench_with_limit_gets_a_note() {
+        // `spill_views` through the SQL harness: no results JSON on either side.
+        let section = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["spill_views"]),
+            true,
+            &[],
+            &[],
+            &[("spill_views".into(), stats(1 << 30))],
+            &[("spill_views".into(), stats(1 << 30))],
+        );
+        assert!(section.contains(
+            "> Pool peaks are not available for `spill_views`: it runs through Criterion \
+             and wrote no results JSON."
+        ));
+        assert!(section.contains(HARNESS_PR));
+        // Neither the per-side notes nor empty tables: those describe a results
+        // JSON that lacks the field, or one that only one side wrote.
+        assert!(!section.contains("reported no `pool_peak_bytes`"));
+        assert!(!section.contains("wrote no results JSON for"));
+        assert!(!section.contains("| Query |"));
+        assert!(!section.contains("Pool accounting vs. process RSS"));
+    }
+
+    #[test]
+    fn criterion_bench_without_limit_renders_nothing() {
+        let section = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["spill_views", "wide_schema"]),
+            false,
+            &[],
+            &[],
+            &[("spill_views".into(), stats(1 << 30))],
+            &[("spill_views".into(), stats(1 << 30))],
+        );
+        assert_eq!(section, "");
+    }
+
+    #[test]
+    fn data_present_renders_the_table_as_before() {
+        let base = vec![peaks("tpch", "tpch_sf1", &[("1", Some(1024))])];
+        let changed = vec![peaks("tpch", "tpch_sf1", &[("1", Some(2048))])];
+        let base_stats = [("tpch".into(), stats(4096))];
+        let changed_stats = [("tpch".into(), stats(4096))];
+        let with_limit = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["tpch"]),
+            true,
+            &base,
+            &changed,
+            &base_stats,
+            &changed_stats,
+        );
+        let without = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &[],
+            false,
+            &base,
+            &changed,
+            &base_stats,
+            &changed_stats,
+        );
+        // A benchmark that wrote its results JSON gets no note, so the section
+        // is exactly what it was before the note existed.
+        assert_eq!(with_limit, without);
+        assert!(!with_limit.contains("not available"));
+        assert!(with_limit.contains("| 1 | 1.0 KiB | 2.0 KiB | +100.0% |"));
+    }
+
+    #[test]
+    fn mixed_run_keeps_the_table_and_notes_the_criterion_benches() {
+        let base = vec![peaks("tpch", "tpch_sf1", &[("1", Some(1024))])];
+        let changed = vec![peaks("tpch", "tpch_sf1", &[("1", Some(2048))])];
+        let section = format_pool_peak_section(
+            "base-sha",
+            "branch",
+            &names(&["tpch", "spill_views", "wide_schema"]),
+            true,
+            &base,
+            &changed,
+            &[],
+            &[],
+        );
+        assert!(section.contains("| 1 | 1.0 KiB | 2.0 KiB | +100.0% |"));
+        assert!(section.contains(
+            "> Pool peaks are not available for `spill_views`, `wide_schema`: they run through Criterion"
+        ));
+        assert!(!section.contains("`tpch`, "));
+    }
+
+    /// `spill_views` with the harness that writes `criterion/spill_views.json`
+    /// on both sides. The suite sets its own limit in SQL, so peaks are there
+    /// even though the trigger set no `DATAFUSION_RUNTIME_MEMORY_LIMIT`.
+    #[test]
+    fn criterion_suite_with_results_json_gets_the_table() {
+        let base = vec![peaks(
+            "spill_views",
+            "spill_views",
+            &[
+                (
+                    "spill_views/q01_sort_string_1_distinct_repeated",
+                    Some(40 << 20),
+                ),
+                (
+                    "spill_views/q04_sort_string_all_distinct_distinct",
+                    Some(96 << 20),
+                ),
+            ],
+        )];
+        let changed = vec![peaks(
+            "spill_views",
+            "spill_views",
+            &[
+                (
+                    "spill_views/q01_sort_string_1_distinct_repeated",
+                    Some(20 << 20),
+                ),
+                (
+                    "spill_views/q04_sort_string_all_distinct_distinct",
+                    Some(96 << 20),
+                ),
+            ],
+        )];
+        for limit_requested in [false, true] {
+            let section = format_pool_peak_section(
+                "base-sha",
+                "branch",
+                &names(&["spill_views"]),
+                limit_requested,
+                &base,
+                &changed,
+                &[("spill_views".into(), stats(1 << 30))],
+                &[("spill_views".into(), stats(1 << 30))],
+            );
+            assert!(section.contains("**`spill_views`**"));
+            assert!(section.contains(
+                "| spill_views/q01_sort_string_1_distinct_repeated | 40.0 MiB | 20.0 MiB | -50.0% |"
+            ));
+            assert!(section.contains(
+                "| spill_views/q04_sort_string_all_distinct_distinct | 96.0 MiB | 96.0 MiB | +0.0% |"
+            ));
+            assert!(section.contains("| spill_views | base (`base-sha`) | 96.0 MiB | 1.0 GiB |"));
+            // Data on both sides: no note of any kind.
+            assert!(!section.contains("> "), "{section}");
+        }
+    }
+
+    /// `baseline: ref:` set to a release whose harness predates the change:
+    /// only the changed side wrote `criterion/spill_views.json`.
+    #[test]
+    fn criterion_suite_with_results_json_on_one_side_notes_the_other() {
+        let changed = vec![peaks(
+            "spill_views",
+            "spill_views",
+            &[(
+                "spill_views/q01_sort_string_1_distinct_repeated",
+                Some(40 << 20),
+            )],
+        )];
+        let section = format_pool_peak_section(
+            "v55.0.0",
+            "branch",
+            &names(&["spill_views"]),
+            true,
+            &[],
+            &changed,
+            &[("spill_views".into(), stats(1 << 30))],
+            &[("spill_views".into(), stats(1 << 30))],
+        );
+        assert!(section.contains(
+            "| spill_views/q01_sort_string_1_distinct_repeated | n/a | 40.0 MiB | n/a |"
+        ));
+        assert!(section.contains(
+            "> Base (`v55.0.0`) wrote no results JSON for `spill_views`, so its column is `n/a`."
+        ));
+        // Not the notes for a results JSON without the field, for a changed
+        // side, or for a benchmark with no results JSON on either side.
+        assert!(!section.contains("reported no `pool_peak_bytes`"));
+        assert!(!section.contains("> Changed"));
+        assert!(!section.contains("Pool peaks are not available"));
+    }
+
     #[test]
     fn parses_pool_peak_when_present() {
         let json = r#"{
@@ -483,6 +878,8 @@ mod tests {
         let section = format_pool_peak_section(
             "abc1234",
             "my-branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(1 << 30))],
@@ -499,6 +896,8 @@ mod tests {
         let section = format_pool_peak_section(
             "v45.0.0",
             "main",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(2048))],
@@ -524,6 +923,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(4096))],
@@ -540,6 +941,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("nlj".into(), stats(8192))],
@@ -569,6 +972,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &changed,
             &[("tpch".into(), stats(8 << 20))],
@@ -597,6 +1002,8 @@ mod tests {
         let section = format_pool_peak_section(
             "base-sha",
             "branch",
+            &[],
+            false,
             &base,
             &[],
             &[("h2o".into(), stats(8192))],
@@ -612,7 +1019,8 @@ mod tests {
     #[test]
     fn missing_resource_stats_drop_only_the_rss_row() {
         let base = vec![peaks("tpch", "tpch_sf1", &[("1", Some(1024))])];
-        let section = format_pool_peak_section("base-sha", "branch", &base, &[], &[], &[]);
+        let section =
+            format_pool_peak_section("base-sha", "branch", &[], false, &base, &[], &[], &[]);
         // Per-query table still renders.
         assert!(section.contains("| 1 | 1.0 KiB | n/a | n/a |"));
         // The pairing table is omitted entirely rather than showing empty rows.
@@ -647,6 +1055,39 @@ mod tests {
         assert_eq!(collected[0].source, "tpch_sf1");
         assert_eq!(collected[0].bench, "tpch");
         assert_eq!(collected[0].max_pool_peak(), Some(4096));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn collect_new_reads_the_criterion_results_subdir() {
+        let dir = std::env::temp_dir().join("pool_peak_collect_new_criterion");
+        let _ = std::fs::remove_dir_all(&dir);
+        let criterion = dir.join(CRITERION_RESULTS_SUBDIR);
+        std::fs::create_dir_all(&criterion).unwrap();
+
+        std::fs::write(
+            dir.join("tpch_sf1.json"),
+            r#"{"queries": [{"query": "1", "pool_peak_bytes": 1}]}"#,
+        )
+        .unwrap();
+        let before = snapshot_json_files(&dir).await;
+        assert_eq!(before.len(), 1);
+
+        // What the Criterion SQL harness writes: no timings, only peaks.
+        std::fs::write(
+            criterion.join("spill_views.json"),
+            r#"{"queries": [{"query": "spill_views/q01_sort_string_1_distinct_repeated",
+                "iterations": [], "start_time": 1, "success": true,
+                "pool_peak_bytes": 41943040}]}"#,
+        )
+        .unwrap();
+
+        let collected = collect_new(&dir, &before, "spill_views").await;
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].source, "spill_views");
+        assert_eq!(collected[0].bench, "spill_views");
+        assert_eq!(collected[0].max_pool_peak(), Some(40 << 20));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
