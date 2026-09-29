@@ -18,6 +18,13 @@ const DEFAULT_DIAGNOSTIC_AFTER_SECS: u64 = 600;
 const DEFAULT_DIAGNOSTIC_INTERVAL_SECS: u64 = 300;
 const PRE_DEADLINE_DIAGNOSTIC_OFFSET_SECS: u64 = 300;
 
+/// Max bytes to hold for one streamed line before it is written out anyway.
+const STREAM_MAX_LINE_BYTES: usize = 64 * 1024;
+/// How long to wait for the output pumps to drain after the command exits. A
+/// grandchild (e.g. a daemon started by the command) can keep the pipes open;
+/// we do not want to block on it.
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A spawned command with its captured-output paths, used to split spawning
 /// from waiting so callers (e.g. the resource monitor) can observe the PID
 /// while the command runs.
@@ -26,10 +33,17 @@ struct SpawnedCommand {
     pid: Option<u32>,
     stdout_path: String,
     stderr_path: String,
+    /// Tasks that copy piped output to the temp files (and container stdout).
+    /// Empty when output is redirected straight to the files.
+    pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// Spawn a command with stdout/stderr redirected to temp log files.
-fn spawn_logged(cmd: &str, args: &[&str], cwd: &Path) -> Result<SpawnedCommand> {
+/// Spawn a command with stdout/stderr captured in temp log files.
+///
+/// With `stream`, the output is also written to the container's stdout line by
+/// line as it is produced, so Cloud Logging timestamps each line (e.g. each
+/// criterion `Benchmarking <name>` line) even if the run is later killed.
+fn spawn_logged(cmd: &str, args: &[&str], cwd: &Path, stream: bool) -> Result<SpawnedCommand> {
     let temp_id = temp_log_id();
     let stdout_path = format!("/tmp/cmd-{temp_id}.stdout");
     let stderr_path = format!("/tmp/cmd-{temp_id}.stderr");
@@ -39,13 +53,38 @@ fn spawn_logged(cmd: &str, args: &[&str], cwd: &Path) -> Result<SpawnedCommand> 
     let stderr_file = std::fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create stderr log: {stderr_path}"))?;
 
-    let child = Command::new(cmd)
+    let (stdout_cfg, stderr_cfg) = if stream {
+        (Stdio::piped(), Stdio::piped())
+    } else {
+        (
+            Stdio::from(stdout_file.try_clone()?),
+            Stdio::from(stderr_file.try_clone()?),
+        )
+    };
+
+    let mut child = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
+        .stdout(stdout_cfg)
+        .stderr(stderr_cfg)
         .spawn()
         .with_context(|| format!("failed to spawn: {cmd} {}", args.join(" ")))?;
+
+    let mut pumps = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        pumps.push(tokio::spawn(pump_output(
+            out,
+            tokio::fs::File::from_std(stdout_file),
+            "[stdout] ",
+        )));
+    }
+    if let Some(err) = child.stderr.take() {
+        pumps.push(tokio::spawn(pump_output(
+            err,
+            tokio::fs::File::from_std(stderr_file),
+            "[stderr] ",
+        )));
+    }
 
     let pid = child.id();
     Ok(SpawnedCommand {
@@ -53,7 +92,70 @@ fn spawn_logged(cmd: &str, args: &[&str], cwd: &Path) -> Result<SpawnedCommand> 
         pid,
         stdout_path,
         stderr_path,
+        pumps,
     })
+}
+
+/// Copy a child's output pipe to `file` byte for byte, and write each line to
+/// the container's stdout with `prefix`. Both `\n` and `\r` end a line in the
+/// stdout copy, so carriage-return progress updates do not pile up into one
+/// giant line. Non-UTF-8 output is converted lossily for the stdout copy only.
+async fn pump_output<R>(mut reader: R, mut file: tokio::fs::File, prefix: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut chunk = vec![0u8; 8192];
+    let mut line = Vec::new();
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "failed to read command output");
+                break;
+            }
+        };
+        let _ = file.write_all(&chunk[..n]).await;
+        for &b in &chunk[..n] {
+            if b == b'\n' || b == b'\r' {
+                emit_line(prefix, &mut line);
+            } else {
+                line.push(b);
+                if line.len() >= STREAM_MAX_LINE_BYTES {
+                    emit_line(prefix, &mut line);
+                }
+            }
+        }
+    }
+    emit_line(prefix, &mut line);
+    let _ = file.flush().await;
+}
+
+/// Write one non-empty line to the container's stdout and clear it.
+fn emit_line(prefix: &str, line: &mut Vec<u8>) {
+    use std::io::Write;
+    if line.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{prefix}{}", String::from_utf8_lossy(line));
+    let _ = out.flush();
+    line.clear();
+}
+
+/// Wait for the output pumps to write everything to the temp files.
+async fn drain_pumps(pumps: Vec<tokio::task::JoinHandle<()>>) {
+    for mut pump in pumps {
+        if tokio::time::timeout(STREAM_DRAIN_TIMEOUT, &mut pump)
+            .await
+            .is_err()
+        {
+            warn!("command output still open after exit; output may be truncated");
+            pump.abort();
+        }
+    }
 }
 
 /// Wait for a spawned command, collect its output into the shared log, and
@@ -64,7 +166,9 @@ async fn finish_logged(
     cwd: &Path,
     mut spawned: SpawnedCommand,
 ) -> Result<String> {
-    let status = wait_for_child(cmd, args, cwd, &mut spawned.child, spawned.pid).await?;
+    let status = wait_for_child(cmd, args, cwd, &mut spawned.child, spawned.pid).await;
+    drain_pumps(std::mem::take(&mut spawned.pumps)).await;
+    let status = status?;
 
     let stdout = tokio::fs::read_to_string(&spawned.stdout_path)
         .await
@@ -95,7 +199,7 @@ async fn finish_logged(
 /// Fails if the command exits with a non-zero status.
 pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String> {
     info!(cmd, ?args, ?cwd, "running command");
-    let spawned = spawn_logged(cmd, args, cwd)?;
+    let spawned = spawn_logged(cmd, args, cwd, false)?;
     finish_logged(cmd, args, cwd, spawned).await
 }
 
@@ -108,6 +212,9 @@ pub async fn run_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<String>
 ///
 /// If `spill_dir` is provided, the monitor will poll the directory size every
 /// second to track peak spill usage.
+///
+/// Output is also streamed to the container's stdout as it is produced (see
+/// [`spawn_logged`]), so long benchmark runs are visible in Cloud Logging.
 pub async fn run_command_monitored(
     cmd: &str,
     args: &[&str],
@@ -115,7 +222,7 @@ pub async fn run_command_monitored(
     spill_dir: Option<PathBuf>,
 ) -> Result<(String, ResourceStats)> {
     info!(cmd, ?args, ?cwd, "running command (monitored)");
-    let spawned = spawn_logged(cmd, args, cwd)?;
+    let spawned = spawn_logged(cmd, args, cwd, true)?;
     let monitor = CgroupMonitor::start(spawned.pid, spill_dir);
     let output = finish_logged(cmd, args, cwd, spawned).await;
     let stats = monitor.finish().await;
@@ -490,6 +597,49 @@ mod tests {
     async fn run_command_failure() {
         let result = run_command("false", &[], Path::new("/tmp")).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_command_monitored_returns_stdout_only() {
+        let (output, _stats) = run_command_monitored(
+            "sh",
+            &["-c", "printf 'a\\nb\\r\\nc'; printf 'err\\n' >&2"],
+            Path::new("/tmp"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "a\nb\r\nc");
+    }
+
+    #[tokio::test]
+    async fn run_command_monitored_failure_includes_output() {
+        let err = run_command_monitored(
+            "sh",
+            &["-c", "echo out; echo err >&2; exit 3"],
+            Path::new("/tmp"),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exited with code 3"), "{err}");
+        assert!(err.contains("stdout:\nout\n"), "{err}");
+        assert!(err.contains("stderr:\nerr\n"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pump_output_copies_bytes_unchanged() {
+        let path = format!("/tmp/cmd-test-{}.out", temp_log_id());
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        // Carriage returns, a missing final newline, invalid UTF-8 and a line
+        // longer than the stream cap must all reach the file byte for byte.
+        let mut input = b"Benchmarking x\rBenchmarking x: done\n\xff\xfe\n".to_vec();
+        input.extend(std::iter::repeat_n(b'z', STREAM_MAX_LINE_BYTES * 2 + 7));
+        pump_output(input.as_slice(), file, "[test] ").await;
+        let written = tokio::fs::read(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(written, input);
     }
 
     #[test]
