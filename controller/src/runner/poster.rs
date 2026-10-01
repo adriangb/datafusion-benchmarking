@@ -4,6 +4,8 @@
 //! have no GitHub creds in the pod).
 
 use anyhow::{Context, Result};
+use backon::{ExponentialBuilder, Retryable};
+use sha2::{Digest, Sha256};
 
 use crate::criterion_report::{self, ExecutionContext, RunnerInfo, WorkerReport};
 use crate::runner::config::RunnerConfig;
@@ -125,19 +127,23 @@ impl CommentPoster {
             result,
             error,
         }];
-        let body = criterion_report::report_body(
+        let report = criterion_report::report_body(
             context,
             merged,
             &workers,
             config.runner_repo_url.as_deref(),
         )
         .await?;
-        gh.post_comment(
-            &config.repo,
-            config.pr_number()?,
-            &criterion_report::github_body(context, body, 0),
-        )
-        .await
+        // Standalone runs have no persisted execution key. Include the trigger,
+        // commits and report contents so recovery cannot reuse another run's data.
+        let key = format!("{:x}", Sha256::digest(report.inline_body().as_bytes()));
+        let (body, _) = (|| report.github_body(gh, &key, 0, None))
+            .retry(ExponentialBuilder::default().with_max_times(3))
+            .when(crate::github::is_retryable)
+            .sleep(tokio::time::sleep)
+            .await?;
+        gh.post_comment(&config.repo, config.pr_number()?, &body)
+            .await
     }
 
     pub async fn post_comment(&self, repo: &str, pr_number: i64, body: &str) -> Result<()> {

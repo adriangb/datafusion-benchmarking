@@ -167,12 +167,79 @@ pub struct WorkerReport<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Keep the native comparison separate so oversized reports can link to it
+/// without re-running critcmp or rewriting its output.
+pub struct Report {
+    prefix: String,
+    comparison: Option<String>,
+    suffix: String,
+    summary: String,
+    gist_description: String,
+}
+
+impl Report {
+    pub fn inline_body(&self) -> String {
+        let comparison = self.comparison.as_ref().map(|text| {
+            format!(
+                "<details><summary>Details</summary>\n\n{}\n\n</details>\n\n",
+                fenced(text, "")
+            )
+        });
+        self.with_comparison(comparison.as_deref().unwrap_or_default())
+    }
+
+    fn with_comparison(&self, section: &str) -> String {
+        format!("{}{section}{}", self.prefix, self.suffix)
+    }
+
+    /// Return the comment and any Gist URL that the caller must persist before
+    /// posting it. Transient/ambiguous API failures leave reconciliation pending;
+    /// permanent failures produce an explicit reporting error instead of hiding
+    /// the execution outcome or silently omitting the comparison.
+    pub async fn github_body(
+        &self,
+        gh: &github::GitHubClient,
+        key: &str,
+        suffix_chars: usize,
+        existing_gist: Option<String>,
+    ) -> Result<(String, Option<String>)> {
+        let inline = self.inline_body();
+        let length = inline.chars().count() + suffix_chars;
+        if length <= MAX_GITHUB_COMMENT_CHARS && existing_gist.is_none() {
+            return Ok((inline, None));
+        }
+        let mut gist_url = existing_gist;
+        if let (Some(comparison), None) = (&self.comparison, &gist_url) {
+            match gh
+                .ensure_comparison_gist(key, &self.gist_description, comparison)
+                .await
+            {
+                Ok(url) => gist_url = Some(url),
+                Err(error) if github::is_retryable(&error) => return Err(error),
+                Err(error) => tracing::warn!(%error, "could not publish comparison Gist"),
+            }
+        }
+        let section = match &gist_url {
+            Some(url) => format!("**Comparison results:** [View the complete native critcmp output]({url}).\n\nThe comparison is published in an unlisted Gist because the original inline report exceeded GitHub's comment limit.\n\n"),
+            None if self.comparison.is_some() => "**Reporting error:** Could not publish the comparison Gist. Check the reporting process logs and ensure its GitHub token has permission to create Gists. No comparison results have been published.\n\n".into(),
+            None => String::new(),
+        };
+        let linked = self.with_comparison(&section);
+        if linked.chars().count() + suffix_chars <= MAX_GITHUB_COMMENT_CHARS {
+            return Ok((linked, gist_url));
+        }
+        // Even diagnostics alone may be too large. Keep execution status and
+        // the complete comparison link, but never truncate diagnostics to fit.
+        Ok((format!("{}\n\n{section}**Reporting error:** The full inline report contains {length} characters and the remaining diagnostics still exceed GitHub's {MAX_GITHUB_COMMENT_CHARS}-character limit. Full runner diagnostics could not be posted; no diagnostic sections have been truncated.", self.summary), gist_url))
+    }
+}
+
 pub async fn report_body(
     context: &ExecutionContext,
     merged: Result<(Baseline, Baseline)>,
     workers: &[WorkerReport<'_>],
     runner_repo: Option<&str>,
-) -> Result<String> {
+) -> Result<Report> {
     let mut errors = Vec::new();
     let mut machines = Vec::new();
     let mut branch_only = Vec::new();
@@ -241,18 +308,30 @@ pub async fn report_body(
     if !branch_only.is_empty() {
         body.push_str(&format!("**Baseline build unavailable for shard(s) {}; changed-only measurements for those workers.**\n\n", branch_only.join(", ")));
     }
-    if let Some(report) = report {
-        body.push_str(&format!(
-            "<details><summary>Details</summary>\n\n{}\n\n</details>\n\n",
-            fenced(&report, "")
+    let completed = workers
+        .iter()
+        .filter(|w| w.error.is_none() && w.result.is_some())
+        .count();
+    let exports = workers.iter().filter(|w| w.result.is_some()).count();
+    let target: String = context.target.chars().take(200).collect();
+    let mut summary = format!("🤖 Benchmark {outcome} (GKE) | [trigger]({})\n\n**Target:** {}\n\n**Workers:** {completed}/{} completed successfully; {exports}/{} exports received.", context.comment_url, escape(&target), context.shards, context.shards);
+    if !branch_only.is_empty() {
+        summary.push_str(&format!(
+            "\n\nBaseline build unavailable for shard(s) {}.",
+            branch_only.join(", ")
         ));
     }
-    body.push_str(&format!(
-        "<details><summary>Per-runner information</summary>\n\n{}\n\n</details>{}",
-        machines.join("\n\n"),
-        github::issues_footer(runner_repo)
-    ));
-    Ok(body)
+    Ok(Report {
+        prefix: body,
+        comparison: report,
+        suffix: format!(
+            "<details><summary>Per-runner information</summary>\n\n{}\n\n</details>{}",
+            machines.join("\n\n"),
+            github::issues_footer(runner_repo)
+        ),
+        summary,
+        gist_description: format!("{} — {}", context.target, context.comment_url),
+    })
 }
 
 pub const MAX_GITHUB_COMMENT_CHARS: usize = 1 << 16;
@@ -289,4 +368,128 @@ fn fenced(text: &str, language: &str) -> String {
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(3.max(longest + 1));
     format!("{fence}{language}\n{text}\n{fence}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard_reporting::tests::github_with_gists;
+
+    fn large_report() -> Report {
+        Report {
+            prefix: "Benchmark completed\n\nconfiguration\n\n".into(),
+            comparison: Some("case/λ ` 1.00 100ns 1.20 120ns\n".repeat(3000)),
+            suffix: "full CPU diagnostics and resource usage".into(),
+            summary: "Benchmark completed; 4/4 completed successfully; 4/4 exports received".into(),
+            gist_description: "target comparison".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gist_fallback_counts_characters_and_reserves_the_comment_marker() {
+        let (gh, _, gists, server) = github_with_gists().await;
+        let mut report = large_report();
+        report.comparison = Some(String::new());
+        let available = MAX_GITHUB_COMMENT_CHARS - report.inline_body().chars().count() - 80;
+        report.comparison = Some("界".repeat(available));
+        let inline = report.inline_body();
+        let (body, url) = report.github_body(&gh, "key", 80, None).await.unwrap();
+        assert_eq!(body, inline);
+        assert!(url.is_none());
+        assert_eq!(gists.lock().await.gets, 0);
+        let (body, url) = report.github_body(&gh, "key", 81, None).await.unwrap();
+        assert!(body.contains("Benchmark completed"));
+        assert!(body.contains("full CPU diagnostics"));
+        assert!(body.contains(url.as_deref().unwrap()));
+        assert!(body.chars().count() + 81 <= MAX_GITHUB_COMMENT_CHARS);
+        assert_eq!(
+            gists.lock().await.gists[0]["files"]["comparison.txt"]["content"],
+            report.comparison.as_deref().unwrap()
+        );
+        report
+            .github_body(&gh, "key", 81, url.clone())
+            .await
+            .unwrap();
+        // A restart must not discard the saved artifact if comparison rendering
+        // subsequently fails or produces a shorter body.
+        report.comparison = None;
+        let (body, saved) = report
+            .github_body(&gh, "key", 81, url.clone())
+            .await
+            .unwrap();
+        assert_eq!(saved, url);
+        assert!(body.contains(saved.as_deref().unwrap()));
+        assert_eq!(gists.lock().await.gets, 1);
+        assert_eq!(gists.lock().await.posts, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn permanent_gist_failure_keeps_execution_status_and_diagnostics() {
+        let (gh, _, gists, server) = github_with_gists().await;
+        gists.lock().await.next_status = Some(403);
+        let (body, url) = large_report()
+            .github_body(&gh, "key", 100, None)
+            .await
+            .unwrap();
+        assert!(url.is_none());
+        assert!(body.contains("Benchmark completed"));
+        assert!(body.contains("full CPU diagnostics"));
+        assert!(body.contains("Could not publish the comparison Gist"));
+        assert!(!body.contains("case/λ"));
+        assert!(body.chars().count() + 100 < MAX_GITHUB_COMMENT_CHARS);
+        assert!(gists.lock().await.gists.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transient_gist_failure_remains_retryable() {
+        let (gh, _, gists, server) = github_with_gists().await;
+        gists.lock().await.next_status = Some(503);
+        let report = large_report();
+        assert!(report.github_body(&gh, "key", 100, None).await.is_err());
+        assert!(gists.lock().await.gists.is_empty());
+        let (body, url) = report.github_body(&gh, "key", 100, None).await.unwrap();
+        assert!(url.is_some());
+        assert!(body.contains("Benchmark completed"));
+        assert!(!body.contains("Reporting error"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_failure_without_comparison_preserves_status_without_a_gist() {
+        let (gh, _, gists, server) = github_with_gists().await;
+        let mut report = large_report();
+        report.comparison = None;
+        report.suffix = "diagnostics".repeat(10000);
+        report.summary =
+            "Benchmark failed or incomplete; 0/4 completed successfully; 0/4 exports received"
+                .into();
+        let (body, url) = report.github_body(&gh, "key", 100, None).await.unwrap();
+        assert!(url.is_none());
+        assert!(body.contains("failed or incomplete"));
+        assert!(body.contains("0/4 exports received"));
+        assert!(body.contains("Full runner diagnostics could not be posted"));
+        assert!(body.chars().count() + 100 < MAX_GITHUB_COMMENT_CHARS);
+        assert_eq!(gists.lock().await.gets, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gist_recovery_paginates_without_creating_another_gist() {
+        let (gh, _, gists, server) = github_with_gists().await;
+        {
+            let mut state = gists.lock().await;
+            state.gists = (0..100).map(|_| serde_json::json!({"description": null, "html_url": "https://gist.github.com/unrelated"})).collect();
+            state.gists.push(serde_json::json!({"description": "old description [benchmark-comparison:key]", "html_url": "https://gist.github.com/recovered"}));
+        }
+        let (body, _) = large_report()
+            .github_body(&gh, "key", 0, None)
+            .await
+            .unwrap();
+        assert!(body.contains("https://gist.github.com/recovered"));
+        assert_eq!(gists.lock().await.gets, 2);
+        assert_eq!(gists.lock().await.posts, 0);
+        server.abort();
+    }
 }

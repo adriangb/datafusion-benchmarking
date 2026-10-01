@@ -247,20 +247,22 @@ async fn finish_execution(
         .into_iter()
         .map(|(id, json)| Ok((id, serde_json::from_str(&json)?)))
         .collect::<Result<_>>()?;
-    let body = final_body(&jobs, &results, &info, runner_repo).await?;
-    let key: String = sqlx::query_scalar(
-        "SELECT finish_key FROM sharded_runs WHERE comment_id = ? AND benchmarks = ?",
+    let report = final_body(&jobs, &results, &info, runner_repo).await?;
+    let (key, existing_gist): (String, Option<String>) = sqlx::query_as(
+        "SELECT finish_key, comparison_gist_url FROM sharded_runs WHERE comment_id = ? AND benchmarks = ?",
     )
     .bind(comment_id)
     .bind(benchmarks)
     .fetch_one(pool)
     .await?;
     let marker = marker(comment_id, "finish", &key);
-    let body = criterion_report::github_body(
-        &ExecutionContext::from_job(job)?,
-        body,
-        marker.chars().count() + 2,
-    );
+    let (body, gist_url) = report
+        .github_body(gh, &key, marker.chars().count() + 2, existing_gist)
+        .await?;
+    if let Some(url) = gist_url {
+        sqlx::query("UPDATE sharded_runs SET comparison_gist_url = ? WHERE comment_id = ? AND benchmarks = ?")
+            .bind(url).bind(comment_id).bind(benchmarks).execute(pool).await?;
+    }
     let id = gh
         .ensure_run_comment(&job.repo, job.pr_number, &marker, &body)
         .await?;
@@ -358,7 +360,7 @@ async fn final_body(
     results: &BTreeMap<i64, ShardResult>,
     info: &BTreeMap<i64, RunnerInfo>,
     runner_repo: Option<&str>,
-) -> Result<String> {
+) -> Result<criterion_report::Report> {
     let first = jobs.first().context("empty execution unit")?;
     ensure!(
         jobs.iter().all(|j| j.benchmarks == first.benchmarks),

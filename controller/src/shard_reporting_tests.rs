@@ -113,10 +113,32 @@ pub(crate) async fn github() -> (
     Arc<Mutex<Vec<Value>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    let (client, comments, _, server) = github_with_gists().await;
+    (client, comments, server)
+}
+
+#[derive(Default)]
+pub(crate) struct GistMock {
+    pub gists: Vec<Value>,
+    pub gets: usize,
+    pub posts: usize,
+    pub next_status: Option<u16>,
+    pub lose_gist_response: bool,
+    pub lose_comment_response: bool,
+}
+
+pub(crate) async fn github_with_gists() -> (
+    GitHubClient,
+    Arc<Mutex<Vec<Value>>>,
+    Arc<Mutex<GistMock>>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = GitHubClient::test_client(format!("http://{}", listener.local_addr().unwrap()));
     let comments = Arc::new(Mutex::new(Vec::<Value>::new()));
     let stored = comments.clone();
+    let gists = Arc::new(Mutex::new(GistMock::default()));
+    let gist_state = gists.clone();
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -145,13 +167,67 @@ pub(crate) async fn github() -> (
                 assert!(n > 0);
                 request.extend_from_slice(&buf[..n]);
             }
-            let response = if header.starts_with("POST ") {
+            let path = header.split_whitespace().nth(1).unwrap();
+            let mut status = 200;
+            let response = if path.starts_with("/gists") {
+                assert!(header
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token"));
+                let mut state = gist_state.lock().await;
+                if header.starts_with("POST ") {
+                    state.posts += 1;
+                    if let Some(code) = state.next_status.take() {
+                        status = code;
+                        serde_json::json!({"message": "Gist publication rejected"})
+                    } else {
+                        let mut gist: Value =
+                            serde_json::from_slice(&request[header_end..header_end + length])
+                                .unwrap();
+                        assert_eq!(gist["public"], false);
+                        assert_eq!(gist["files"].as_object().unwrap().len(), 1);
+                        assert!(gist["files"]["comparison.txt"]["content"].is_string());
+                        gist["html_url"] = format!(
+                            "https://gist.github.com/benchmark/{}",
+                            state.gists.len() + 1
+                        )
+                        .into();
+                        state.gists.push(gist.clone());
+                        if std::mem::take(&mut state.lose_gist_response) {
+                            continue;
+                        }
+                        gist
+                    }
+                } else {
+                    assert!(header.starts_with("GET "));
+                    state.gets += 1;
+                    let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+                    let page: usize = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "page")
+                        .unwrap()
+                        .1
+                        .parse()
+                        .unwrap();
+                    serde_json::to_value(
+                        state
+                            .gists
+                            .iter()
+                            .skip((page - 1) * 100)
+                            .take(100)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                }
+            } else if header.starts_with("POST ") {
                 let body: Value =
                     serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
                 let mut comments = stored.lock().await;
                 let comment =
                     serde_json::json!({ "id": comments.len() + 100, "body": body["body"] });
                 comments.push(comment.clone());
+                if std::mem::take(&mut gist_state.lock().await.lose_comment_response) {
+                    continue;
+                }
                 comment
             } else {
                 assert!(header.starts_with("GET "), "{header}");
@@ -166,11 +242,11 @@ pub(crate) async fn github() -> (
                 }
             };
             let json = serde_json::to_string(&response).unwrap();
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}", json.len());
+            let response = format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}", json.len());
             stream.write_all(response.as_bytes()).await.unwrap();
         }
     });
-    (client, comments, server)
+    (client, comments, gists, server)
 }
 
 #[tokio::test]
@@ -201,7 +277,7 @@ async fn direct_arrow_reports_use_the_shared_formatter_without_a_controller() {
         config::{BenchType, PosterMode, RunnerConfig},
         poster::CommentPoster,
     };
-    let (gh, comments, server) = github().await;
+    let (gh, comments, gists, server) = github_with_gists().await;
     let poster = CommentPoster::Direct(gh);
     let mut config = RunnerConfig {
         pr_url: "https://github.com/apache/arrow-rs/pull/42".into(),
@@ -275,6 +351,24 @@ async fn direct_arrow_reports_use_the_shared_formatter_without_a_controller() {
             assert!(body.contains("No matching cases; no measurements run."));
         }
     }
+    let mut oversized = result;
+    oversized.info.cpu_details = "CPU details\n".repeat(7000);
+    gists.lock().await.lose_gist_response = true;
+    poster
+        .criterion_result(&config, &context, &oversized)
+        .await
+        .unwrap();
+    let body = comments.lock().await.last().unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(body.contains("Benchmark completed"));
+    assert!(body.contains("https://gist.github.com/benchmark/1"));
+    assert_eq!(gists.lock().await.posts, 1);
+    assert_eq!(
+        gists.lock().await.gists[0]["files"]["comparison.txt"]["content"],
+        "No matching cases; no measurements run.\n"
+    );
     config.shard = crate::sharding::Shard { count: 2, index: 0 };
     assert!(poster.criterion_sources(&config).await.is_err());
     server.abort();
@@ -282,7 +376,7 @@ async fn direct_arrow_reports_use_the_shared_formatter_without_a_controller() {
 
 #[tokio::test]
 #[ignore = "requires critcmp 0.1.8 on PATH"]
-async fn oversized_report_publishes_one_explicit_error_and_keeps_exports() {
+async fn oversized_diagnostics_keep_execution_status_and_link_to_complete_comparison() {
     let pool = db::connect("sqlite::memory:").await.unwrap();
     let jobs = request(&pool, 302, 1, &["target"]).await;
     let job = &jobs[0];
@@ -298,8 +392,10 @@ async fn oversized_report_publishes_one_explicit_error_and_keeps_exports() {
     let comments = comments.lock().await;
     assert_eq!(comments.len(), 2);
     let body = comments[1]["body"].as_str().unwrap();
-    assert!(body.contains("report could not be posted"));
-    assert!(body.contains("No partial results or runner information have been posted"));
+    assert!(body.contains("Benchmark completed"));
+    assert!(body.contains("1/1 completed successfully; 1/1 exports received"));
+    assert!(body.contains("https://gist.github.com/benchmark/1"));
+    assert!(body.contains("Full runner diagnostics could not be posted"));
     assert!(!body.contains("CPU diagnostics"));
     assert!(body.chars().count() <= criterion_report::MAX_GITHUB_COMMENT_CHARS);
     let stored: String =
@@ -309,6 +405,129 @@ async fn oversized_report_publishes_one_explicit_error_and_keeps_exports() {
             .await
             .unwrap();
     assert_eq!(serde_json::from_str::<ShardResult>(&stored).unwrap(), data);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires critcmp 0.1.8 on PATH"]
+async fn oversized_comparisons_publish_once_per_target_and_recover_lost_responses() {
+    for count in [1, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("db.sqlite").display());
+        let pool = db::connect(&url).await.unwrap();
+        let jobs = request(&pool, 304, count, &["target", "another"]).await;
+        let (gh, comments, gists, server) = github_with_gists().await;
+        let mut exports = BTreeMap::new();
+        for job in &jobs {
+            ensure_started(&pool, &gh, job, None).await.unwrap();
+            let mut data = result(job);
+            for index in 0..400 {
+                let id = format!("case/{index:04}/{}", "long-name-λ-".repeat(15));
+                if job.shard().unwrap().owns(&target(job).unwrap(), &id) {
+                    data.base
+                        .as_mut()
+                        .unwrap()
+                        .benchmarks
+                        .insert(id.clone(), record("base", &id, 100.0));
+                    data.changed
+                        .benchmarks
+                        .insert(id.clone(), record("changed", &id, 80.0));
+                }
+            }
+            store_result(&pool, job, &data).await.unwrap();
+            exports.insert(job.id, data);
+            db::update_job_status(&pool, job.id, JobStatus::Completed, None, None)
+                .await
+                .unwrap();
+        }
+        gists.lock().await.lose_gist_response = true;
+        reconcile(&pool, &gh, None).await.unwrap();
+        // One Gist POST succeeded but its response was lost. The other target
+        // still finishes independently, without waiting for the retry.
+        assert_eq!(gists.lock().await.gists.len(), 2);
+        assert_eq!(comments.lock().await.len(), 3);
+        gists.lock().await.lose_comment_response = true;
+        reconcile(&pool, &gh, None).await.unwrap();
+        assert_eq!(gists.lock().await.posts, 2);
+        assert_eq!(comments.lock().await.len(), 4);
+        let gets = gists.lock().await.gets;
+        pool.close().await;
+        let pool = db::connect(&url).await.unwrap();
+        reconcile(&pool, &gh, None).await.unwrap();
+        reconcile(&pool, &gh, None).await.unwrap();
+        assert_eq!(
+            gists.lock().await.gets,
+            gets,
+            "persisted Gists need no lookup"
+        );
+        assert_eq!(gists.lock().await.posts, 2);
+        assert_eq!(comments.lock().await.len(), 4);
+        for name in ["target", "another"] {
+            let (link, finished): (String, i64) = sqlx::query_as("SELECT comparison_gist_url, finished_comment_id FROM sharded_runs WHERE comment_id = 304 AND benchmarks = ?")
+                .bind(serde_json::to_string(&[name]).unwrap()).fetch_one(&pool).await.unwrap();
+            let group: Vec<_> = jobs.iter().filter(|j| target(j).unwrap() == name).collect();
+            let (base, changed) = merge(&group, &exports).unwrap();
+            let native = compare(&base, &changed).await.unwrap();
+            assert!(native.chars().count() > criterion_report::MAX_GITHUB_COMMENT_CHARS);
+            let state = gists.lock().await;
+            let gist = state.gists.iter().find(|g| g["html_url"] == link).unwrap();
+            assert_eq!(gist["files"]["comparison.txt"]["content"], native);
+            let comments = comments.lock().await;
+            let body = comments.iter().find(|c| c["id"] == finished).unwrap()["body"]
+                .as_str()
+                .unwrap();
+            assert!(body.contains("Benchmark completed"));
+            assert!(body.contains(&link));
+            assert!(!body.contains("case/0000"));
+            assert!(body.chars().count() <= criterion_report::MAX_GITHUB_COMMENT_CHARS);
+            for job in group {
+                assert!(body.contains(&exports[&job.id].info.cpu_details));
+                assert!(body.contains(&exports[&job.id].info.resource_report));
+            }
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn gist_migration_upgrades_schema_five_without_reposting_completed_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let url = format!("sqlite://{}", path.display());
+    let pool = SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    let mut deployed = sqlx::migrate!("./migrations");
+    deployed.migrations.to_mut().retain(|m| m.version <= 5);
+    deployed.run(&pool).await.unwrap();
+    let jobs = request(&pool, 305, 1, &["target"]).await;
+    let data = result(&jobs[0]);
+    store_result(&pool, &jobs[0], &data).await.unwrap();
+    db::update_job_status(&pool, jobs[0].id, JobStatus::Completed, None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sharded_runs SET started_comment_id = 100, finished_comment_id = 101 WHERE comment_id = 305").execute(&pool).await.unwrap();
+    let keys: (String, String) = sqlx::query_as("SELECT start_key, finish_key FROM sharded_runs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let pool = db::connect(&url).await.unwrap();
+    let after: (String, String, i64, i64, Option<String>) = sqlx::query_as("SELECT start_key, finish_key, started_comment_id, finished_comment_id, comparison_gist_url FROM sharded_runs").fetch_one(&pool).await.unwrap();
+    assert_eq!(after, (keys.0, keys.1, 100, 101, None));
+    let stored: String = sqlx::query_scalar("SELECT result_json FROM shard_results")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::from_str::<ShardResult>(&stored).unwrap(), data);
+    let (gh, comments, gists, server) = github_with_gists().await;
+    reconcile(&pool, &gh, None).await.unwrap();
+    assert!(comments.lock().await.is_empty());
+    assert_eq!(gists.lock().await.gets, 0);
     server.abort();
 }
 
@@ -394,7 +613,8 @@ async fn failed_workers_keep_their_full_diagnostics() {
     }
     let body = final_body(&jobs, &BTreeMap::new(), &infos, None)
         .await
-        .unwrap();
+        .unwrap()
+        .inline_body();
     assert!(body.contains("failed or incomplete"));
     assert!(!body.contains("partial results"));
     assert!(!body.contains("Sharding factor:"));
@@ -645,7 +865,7 @@ async fn migration_from_deployed_schema_preserves_jobs_and_reports_only_outstand
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
         let after: Vec<JobState> = sqlx::query_as(job_state).fetch_all(&pool).await.unwrap();
         assert_eq!(before, after);
         let jobs: Vec<BenchmarkJob> = sqlx::query_as("SELECT * FROM benchmark_jobs")
@@ -976,7 +1196,8 @@ async fn single_worker_empty_sides_preserve_the_available_comparison() {
         jobs[0].status = "completed".into();
         let body = final_body(&jobs, &results, &BTreeMap::new(), None)
             .await
-            .unwrap();
+            .unwrap()
+            .inline_body();
         assert!(body.contains("Benchmark completed"), "{body}");
         assert!(!body.contains("Baseline build unavailable"));
         if has_base || has_changed {
@@ -1022,9 +1243,10 @@ async fn real_critcmp_handles_partial_failure_branch_only_and_comment_overflow()
     }
     jobs[0].status = "failed".into();
     jobs[0].error_message = Some("K8s Job not found".into());
-    let body = final_body(&jobs, &results, &BTreeMap::new(), None)
+    let report = final_body(&jobs, &results, &BTreeMap::new(), None)
         .await
         .unwrap();
+    let body = report.inline_body();
     assert!(body.contains("partial results"));
     assert!(body.contains("K8s Job not found"));
     assert!(body.contains("changed-only"));
@@ -1039,10 +1261,21 @@ async fn real_critcmp_handles_partial_failure_branch_only_and_comment_overflow()
         .any(|line| line.starts_with(&format!("{failed_case} "))));
     assert!(body.chars().count() > criterion_report::MAX_GITHUB_COMMENT_CHARS);
     assert!(!body.contains("lines omitted"));
-    let context = ExecutionContext::from_job(&jobs[0]).unwrap();
-    let error = criterion_report::github_body(&context, body, 100);
-    assert!(error.contains("report could not be posted"));
-    assert!(error.contains("No partial results or runner information have been posted"));
-    assert!(!error.contains("long-benchmark-name"));
-    assert!(error.chars().count() + 100 < criterion_report::MAX_GITHUB_COMMENT_CHARS);
+    let (gh, _, gists, server) = github_with_gists().await;
+    let (body, url) = report
+        .github_body(&gh, "partial-key", 100, None)
+        .await
+        .unwrap();
+    assert!(body.contains("failed or incomplete — partial results"));
+    assert!(body.contains("K8s Job not found"));
+    assert!(body.contains("changed-only"));
+    assert!(body.contains(url.as_deref().unwrap()));
+    assert!(!body.contains("long-benchmark-name"));
+    assert!(body.chars().count() + 100 < criterion_report::MAX_GITHUB_COMMENT_CHARS);
+    let (base, changed) = merge(&jobs.iter().collect::<Vec<_>>(), &results).unwrap();
+    assert_eq!(
+        gists.lock().await.gists[0]["files"]["comparison.txt"]["content"],
+        compare(&base, &changed).await.unwrap()
+    );
+    server.abort();
 }

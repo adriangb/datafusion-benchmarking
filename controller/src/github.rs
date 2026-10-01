@@ -44,7 +44,7 @@ pub struct GitHubClient {
 }
 
 /// Determine whether an error (or status) is worth retrying.
-fn is_retryable(err: &anyhow::Error) -> bool {
+pub(crate) fn is_retryable(err: &anyhow::Error) -> bool {
     // Check for reqwest errors (network / connection failures)
     if let Some(re) = err.downcast_ref::<reqwest::Error>() {
         if re.is_connect() || re.is_timeout() || re.is_request() {
@@ -299,6 +299,61 @@ impl GitHubClient {
             }
         }
         anyhow::bail!("comment pagination limit reached; refusing to risk a duplicate notification")
+    }
+
+    /// Recover or create an unlisted comparison Gist. As with notifications,
+    /// never retry the POST blindly: a lost response may hide a successful write.
+    /// Listing the authenticated user's Gists also prevents other users from
+    /// spoofing an execution's recovery key.
+    pub async fn ensure_comparison_gist(
+        &self,
+        key: &str,
+        description: &str,
+        comparison: &str,
+    ) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct Gist {
+            description: Option<String>,
+            html_url: String,
+        }
+        let marker = format!("[benchmark-comparison:{key}]");
+        let url = format!("{API_BASE}/gists");
+        for page in 1..=MAX_PAGES {
+            let gists: Vec<Gist> = self
+                .get_with_retry(&url, &[("per_page", "100"), ("page", &page.to_string())])
+                .await?
+                .json()
+                .await?;
+            if let Some(gist) = gists.iter().find(|g| {
+                g.description
+                    .as_deref()
+                    .is_some_and(|d| d.ends_with(&marker))
+            }) {
+                return Ok(gist.html_url.clone());
+            }
+            if gists.len() < 100 {
+                #[cfg(test)]
+                let url = match &self.api_base {
+                    Some(base) => url.replacen(API_BASE, base, 1),
+                    None => url.clone(),
+                };
+                let response = self
+                    .request_builder(self.client.post(&url))
+                    .json(&serde_json::json!({
+                        "description": format!("{description} {marker}"),
+                        "public": false,
+                        "files": { "comparison.txt": { "content": comparison } }
+                    }))
+                    .send()
+                    .await?;
+                let gist: Gist = Self::check_response(response, "POST comparison Gist")
+                    .await?
+                    .json()
+                    .await?;
+                return Ok(gist.html_url);
+            }
+        }
+        anyhow::bail!("Gist pagination limit reached; refusing to risk a duplicate comparison")
     }
 
     /// Look up a PR and return its `head.ref` (the source branch name).
