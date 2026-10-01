@@ -368,6 +368,13 @@ cargo test --workspace -- --include-ignored
 
 The controller needs a GitHub token and a runner image. SQLite is used for state (auto-created).
 
+The token must be a user token, not a GitHub App token, because the controller writes Gists. It needs these permissions:
+
+- For a classic PAT, use the `public_repo` and `gist` scopes. `public_repo` lets the controller post PR comments on the public watched repositories. `gist` lets it create Gists.
+- For a fine-grained PAT, give write access to issues and pull requests on the watched repositories, and set **Account permissions → Gists** to **Read and write**.
+
+When a benchmark report is too long for a PR comment, the controller uploads the full comparison to an unlisted Gist owned by the token's account and links it from the comment. Unlisted Gists are not private: anyone with the URL can read them. Without Gist write access, oversized reports show a reporting error instead of the full comparison.
+
 ```bash
 export GITHUB_TOKEN="ghp_..."
 export RUNNER_IMAGE="us-docker.pkg.dev/.../runner:latest"
