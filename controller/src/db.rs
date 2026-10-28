@@ -123,7 +123,7 @@ pub async fn enqueue_jobs(
     .fetch_one(&mut *tx)
     .await?;
     anyhow::ensure!(
-        pending + jobs.len() as i64 <= crate::config::MAX_QUEUED_PER_USER,
+        pending + jobs.len() as i64 <= crate::config::max_queued_for(first.login),
         "per-user queue limit exceeded"
     );
     for job in jobs {

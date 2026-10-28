@@ -12,7 +12,9 @@ use crate::benchmarks::{
     allowed_users_markdown, detect_benchmark, is_benchmark_trigger, is_queue_request,
     is_singular_no_names, usage_message, DetectResult,
 };
-use crate::config::{Config, RepoEntry, MAX_QUEUED_PER_USER};
+#[cfg(test)]
+use crate::config::MAX_QUEUED_PER_USER;
+use crate::config::{max_queued_for, Config, RepoEntry};
 use crate::db;
 use crate::github::{self, GitHubClient};
 use crate::models::{GitHubComment, JobInsert};
@@ -120,6 +122,7 @@ fn rate_limit_message(
     comment_url: &str,
     pending: i64,
     incoming: i64,
+    limit: i64,
     runner_repo_url: Option<&str>,
 ) -> String {
     let footer = github::issues_footer(runner_repo_url);
@@ -127,7 +130,7 @@ fn rate_limit_message(
         "Hi @{login}, thanks for the request ({comment_url}). \
          You already have {pending} pending benchmark job(s), and this request \
          would add {incoming} more — exceeding the per-user queue limit of \
-         {MAX_QUEUED_PER_USER}. Please wait for some of your current runs to \
+         {limit}. Please wait for some of your current runs to \
          finish before submitting more.{footer}"
     )
 }
@@ -288,8 +291,16 @@ async fn process_comment(
     // benchmark name); count them all against the cap before inserting any.
     let incoming = benchmarks.len().max(1) as i64 * i64::from(shard_count);
     let pending = db::count_user_pending(pool, login).await?;
-    if pending + incoming > MAX_QUEUED_PER_USER {
-        let msg = rate_limit_message(login, comment_url, pending, incoming, runner_repo_url);
+    let limit = max_queued_for(login);
+    if pending + incoming > limit {
+        let msg = rate_limit_message(
+            login,
+            comment_url,
+            pending,
+            incoming,
+            limit,
+            runner_repo_url,
+        );
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
@@ -489,7 +500,14 @@ mod tests {
 
     #[test]
     fn rate_limit_msg_contains_fields() {
-        let msg = rate_limit_message("alice", "https://example.com/c/9", 12, 4, None);
+        let msg = rate_limit_message(
+            "alice",
+            "https://example.com/c/9",
+            12,
+            4,
+            MAX_QUEUED_PER_USER,
+            None,
+        );
         assert!(msg.contains("@alice"));
         assert!(msg.contains("https://example.com/c/9"));
         assert!(msg.contains("12 pending"));
