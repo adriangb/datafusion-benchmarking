@@ -18,6 +18,17 @@ pub const MAX_RUNNING_PER_USER: i64 = 5;
 /// to wait instead of silently dropping the request.
 pub const MAX_QUEUED_PER_USER: i64 = 15;
 
+/// Per-user overrides of [`MAX_QUEUED_PER_USER`], matched case-insensitively.
+const QUEUED_LIMIT_OVERRIDES: &[(&str, i64)] = &[("adriangb", 64)];
+
+/// Maximum benchmark jobs `login` can have in the `pending` state at once.
+pub fn max_queued_for(login: &str) -> i64 {
+    QUEUED_LIMIT_OVERRIDES
+        .iter()
+        .find(|(user, _)| user.eq_ignore_ascii_case(login))
+        .map_or(MAX_QUEUED_PER_USER, |&(_, limit)| limit)
+}
+
 /// Per-repo benchmark configuration loaded from JSON config.
 ///
 /// There is no benchmark allowlist: any name a user requests is scheduled and
@@ -197,5 +208,17 @@ mod tests {
         let val = env_required("__TEST_REQUIRED_SET__").unwrap();
         assert_eq!(val, "world");
         std::env::remove_var("__TEST_REQUIRED_SET__");
+    }
+}
+
+#[cfg(test)]
+mod queued_limit_tests {
+    use super::*;
+
+    #[test]
+    fn override_applies_case_insensitively() {
+        assert_eq!(max_queued_for("adriangb"), 64);
+        assert_eq!(max_queued_for("AdrianGB"), 64);
+        assert_eq!(max_queued_for("alice"), MAX_QUEUED_PER_USER);
     }
 }
