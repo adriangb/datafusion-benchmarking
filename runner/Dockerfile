@@ -44,6 +44,9 @@ ENV RUSTUP_TOOLCHAIN=stable
 # processes start in parallel).
 RUN rustup update stable --no-self-update
 
+# protobuf-compiler: the `substrait` crate's build script needs `protoc` on
+# PATH, so any datafusion-substrait bench fails to compile without it.
+# DataFusion's own CI installs the same package.
 RUN apt-get update && apt-get install -y \
     git \
     cmake \
@@ -52,6 +55,7 @@ RUN apt-get update && apt-get install -y \
     gdb \
     pkg-config \
     libssl-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Install gh CLI
