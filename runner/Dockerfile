@@ -2,7 +2,8 @@
 FROM rust:1-bookworm AS tools
 
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
-    && cargo binstall -y --no-symlinks critcmp tpchgen-cli sccache
+    && cargo binstall -y --no-symlinks --version 0.1.8 critcmp \
+    && cargo binstall -y --no-symlinks tpchgen-cli sccache
 
 # ── Stage 2: build bench-cache binary ──
 FROM rust:1-bookworm AS bench-cache
@@ -43,6 +44,9 @@ ENV RUSTUP_TOOLCHAIN=stable
 # processes start in parallel).
 RUN rustup update stable --no-self-update
 
+# protobuf-compiler: the `substrait` crate's build script needs `protoc` on
+# PATH, so any datafusion-substrait bench fails to compile without it.
+# DataFusion's own CI installs the same package.
 RUN apt-get update && apt-get install -y \
     git \
     cmake \
@@ -51,6 +55,7 @@ RUN apt-get update && apt-get install -y \
     gdb \
     pkg-config \
     libssl-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Install gh CLI

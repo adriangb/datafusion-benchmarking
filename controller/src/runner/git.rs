@@ -105,6 +105,22 @@ pub async fn checkout(dir: &Path, ref_: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fetch an immutable commit, including commits outside a shallow clone or on
+/// a fork PR, and verify it rather than following a moving branch at runtime.
+pub async fn checkout_frozen(dir: &Path, sha: &str) -> Result<()> {
+    anyhow::ensure!(
+        sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid frozen commit SHA"
+    );
+    run_command("git", &["fetch", "--depth=1", "origin", sha], dir).await?;
+    checkout(dir, sha).await?;
+    anyhow::ensure!(
+        rev_parse_head(dir).await?.eq_ignore_ascii_case(sha),
+        "frozen source checkout mismatch"
+    );
+    Ok(())
+}
+
 /// Fetch the PR ref into an existing clone (without checking it out).
 pub async fn fetch_pr_ref(pr_url: &str, dir: &Path) -> Result<()> {
     let pr_number = pr_url

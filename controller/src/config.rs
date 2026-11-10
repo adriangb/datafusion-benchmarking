@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::models::JobType;
+use crate::resources::{ResourceLimits, DEFAULT_MAX_CPU, DEFAULT_MAX_MEMORY};
 
 /// Maximum benchmark jobs a single user can have in the `running` state at once.
 /// Enforced at pickup in `db::get_pending_jobs`, so pending jobs sit in the
@@ -16,6 +17,17 @@ pub const MAX_RUNNING_PER_USER: i64 = 5;
 /// Enforced at ingestion in `github_poller::process_comment`; the user is told
 /// to wait instead of silently dropping the request.
 pub const MAX_QUEUED_PER_USER: i64 = 15;
+
+/// Per-user overrides of [`MAX_QUEUED_PER_USER`], matched case-insensitively.
+const QUEUED_LIMIT_OVERRIDES: &[(&str, i64)] = &[("adriangb", 64)];
+
+/// Maximum benchmark jobs `login` can have in the `pending` state at once.
+pub fn max_queued_for(login: &str) -> i64 {
+    QUEUED_LIMIT_OVERRIDES
+        .iter()
+        .find(|(user, _)| user.eq_ignore_ascii_case(login))
+        .map_or(MAX_QUEUED_PER_USER, |&(_, limit)| limit)
+}
 
 /// Per-repo benchmark configuration loaded from JSON config.
 ///
@@ -77,6 +89,8 @@ pub struct BenchmarkConfig {
 /// ACTIVE_DEADLINE_SECS      7200                                  no
 /// TTL_AFTER_FINISHED_SECS   3600                                  no
 /// DEFAULT_MACHINE_FAMILY    c4a                                   no
+/// MAX_CPU                   72                                    no
+/// MAX_MEMORY                576Gi                                 no
 /// STORAGE_CLASS             hyperdisk-balanced                    no
 /// SCCACHE_GCS_BUCKET        —                                     no
 /// DATA_CACHE_BUCKET          —                                     no
@@ -97,6 +111,8 @@ pub struct Config {
     pub ephemeral_storage: String,
     /// Default GCE machine family for benchmark pods (`"c4a"` for ARM, `"c4"` for x86).
     pub default_machine_family: String,
+    /// Caps on the pod size a trigger comment may ask for.
+    pub resource_limits: ResourceLimits,
     /// Maximum wall-clock seconds a K8s Job may run before being killed.
     pub active_deadline_secs: i64,
     /// Seconds after completion before the K8s Job object is garbage-collected.
@@ -131,6 +147,12 @@ impl Config {
             default_memory: env_or("DEFAULT_MEMORY", "65Gi"),
             ephemeral_storage: env_or("EPHEMERAL_STORAGE", "128Gi"),
             default_machine_family: env_or("DEFAULT_MACHINE_FAMILY", "c4a"),
+            resource_limits: ResourceLimits::new(
+                &env_or("MAX_CPU", DEFAULT_MAX_CPU),
+                &env_or("MAX_MEMORY", DEFAULT_MAX_MEMORY),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("MAX_CPU / MAX_MEMORY")?,
             active_deadline_secs: env_or("ACTIVE_DEADLINE_SECS", "7200")
                 .parse()
                 .context("ACTIVE_DEADLINE_SECS")?,
@@ -186,5 +208,17 @@ mod tests {
         let val = env_required("__TEST_REQUIRED_SET__").unwrap();
         assert_eq!(val, "world");
         std::env::remove_var("__TEST_REQUIRED_SET__");
+    }
+}
+
+#[cfg(test)]
+mod queued_limit_tests {
+    use super::*;
+
+    #[test]
+    fn override_applies_case_insensitively() {
+        assert_eq!(max_queued_for("adriangb"), 64);
+        assert_eq!(max_queued_for("AdrianGB"), 64);
+        assert_eq!(max_queued_for("alice"), MAX_QUEUED_PER_USER);
     }
 }

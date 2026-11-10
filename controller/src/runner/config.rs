@@ -4,7 +4,8 @@
 //! `job_manager.rs`): `PR_URL`, `COMMENT_ID`, `BENCHMARKS`, `BENCH_TYPE`,
 //! `BENCH_NAME`, `BENCH_FILTER`, `REPO`, `JOB_ID`, `RUNNER_TOKEN`,
 //! `CONTROLLER_URL`, `RUNNER_REPO_URL`, `SHARED_ENV_VARS`,
-//! `BASELINE_ENV_VARS`, `CHANGED_ENV_VARS`. The scheduled main-tracking
+//! `BASELINE_ENV_VARS`, `CHANGED_ENV_VARS`, `REQUESTED_CPU`,
+//! `REQUESTED_MEMORY`, `REQUESTED_ARCH`. The scheduled main-tracking
 //! workflow instead supplies `GITHUB_TOKEN` directly (no PR author to
 //! distrust).
 
@@ -13,8 +14,10 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 
 use crate::github::GitHubClient;
+use crate::resources::PodResources;
 use crate::runner::controller_client::ControllerClient;
 use crate::runner::poster::CommentPoster;
+use crate::sharding::{FrozenSources, Shard, WorkerShard};
 
 /// Benchmark runner variant, parsed from `BENCH_TYPE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +28,15 @@ pub enum BenchType {
 }
 
 impl BenchType {
+    pub fn shard_support(self) -> crate::sharding::ShardSupport {
+        match self {
+            Self::Datafusion | Self::MainTracking => {
+                crate::models::JobType::Datafusion.shard_support()
+            }
+            Self::ArrowCriterion => crate::models::JobType::ArrowCriterion.shard_support(),
+        }
+    }
+
     fn from_str(s: &str) -> Result<Self> {
         match s {
             // `standard`/`criterion` are legacy job-type strings that may still
@@ -78,6 +90,14 @@ pub struct RunnerConfig {
     pub changed_ref: Option<String>,
     /// URL of the benchmark runner's own GitHub repo (for "file an issue" links).
     pub runner_repo_url: Option<String>,
+    /// Pod sizing the trigger comment asked for. Set only for the fields the
+    /// trigger named, so comments can report the request rather than the
+    /// defaults it left alone.
+    pub resources: PodResources,
+    pub shard: Shard,
+    pub frozen_sources: Option<FrozenSources>,
+    /// Raw body of the trigger comment, quoted in result comments.
+    pub trigger_comment: Option<String>,
 }
 
 impl RunnerConfig {
@@ -101,7 +121,19 @@ impl RunnerConfig {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        let worker = WorkerShard::from_args(std::env::args().skip(1))?;
+        let (shard, frozen_sources) = if let Some(worker) = worker {
+            BenchType::from_str(&bench_type_str)?
+                .shard_support()
+                .validate_execution(worker.shard)?;
+            (worker.shard, Some(worker.sources))
+        } else {
+            (Shard::default(), None)
+        };
+
         Ok(Self {
+            shard,
+            frozen_sources,
             pr_url,
             comment_id,
             comment_url,
@@ -119,6 +151,12 @@ impl RunnerConfig {
             baseline_ref: std::env::var("BASELINE_REF").ok(),
             changed_ref: std::env::var("CHANGED_REF").ok(),
             runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
+            trigger_comment: std::env::var("TRIGGER_COMMENT").ok(),
+            resources: PodResources {
+                cpu: std::env::var("REQUESTED_CPU").ok(),
+                memory: std::env::var("REQUESTED_MEMORY").ok(),
+                arch: std::env::var("REQUESTED_ARCH").ok(),
+            },
         })
     }
 

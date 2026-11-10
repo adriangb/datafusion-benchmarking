@@ -1,5 +1,8 @@
 FROM rust:1-bookworm AS builder
 
+# The reporting protocol/compact table renderer targets this critcmp version.
+RUN cargo install critcmp --version 0.1.8 --locked
+
 WORKDIR /build
 
 # Copy workspace root manifests for dependency caching
@@ -22,6 +25,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/controller /usr/local/bin/controller
+COPY --from=builder /usr/local/cargo/bin/critcmp /usr/local/bin/critcmp
 
 EXPOSE 8080
 ENTRYPOINT ["controller"]

@@ -134,8 +134,9 @@ impl CgroupMonitor {
     /// monitored window is not attributed to the benchmark. When `root_pid` is
     /// `None`, falls back to the pod-wide cgroup figures.
     ///
-    /// If `spill_dir` is provided, the polling loop will also sample the total
-    /// size of files in that directory every second to track peak spill usage.
+    /// If `spill_dir` is provided, the polling loop will also sample the size
+    /// of DataFusion's spill directories in it every second to track peak
+    /// spill usage (see [`spill_size`]).
     pub fn start(root_pid: Option<u32>, spill_dir: Option<PathBuf>) -> Self {
         let start_memory = sample_memory(root_pid).unwrap_or(0);
         let start_cpu = read_cpu_stat();
@@ -210,7 +211,7 @@ impl CgroupMonitor {
                     }
                     sample(&mut cpu_first, &mut cpu_last);
                     if let Some(ref dir) = spill_dir {
-                        let size = dir_size(dir);
+                        let size = spill_size(dir);
                         spill_peak.fetch_max(size, Ordering::Relaxed);
                     }
                 }
@@ -480,6 +481,37 @@ fn read_cpu_stat() -> Option<CpuStat> {
     })
 }
 
+/// Size of the DataFusion spill files under `spill_dir`.
+///
+/// The benchmark runs with `TMPDIR=<spill_dir>`, so everything in the process
+/// tree that writes temp files writes them here. That includes rustc, cc and
+/// the linker when the monitored command compiles (`cargo bench --bench sql`).
+/// Only the top-level directories that a DataFusion `DiskManager` creates are
+/// counted:
+///   - `.tmp*`: `DiskManagerMode::OsTmpDirectory` (the default, which dfbench
+///     uses) calls `tempfile::tempdir()`, which uses the `.tmp` prefix.
+///   - `datafusion-*`: `DiskManagerMode::Directories` creates its directory
+///     with the `datafusion-` prefix.
+///
+/// rustc uses `rustc*` directories and cc uses loose top-level files, so
+/// neither is counted.
+fn spill_size(spill_dir: &Path) -> u64 {
+    let entries = match std::fs::read_dir(spill_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    entries
+        .flatten()
+        .filter(|entry| is_spill_dir_name(&entry.file_name().to_string_lossy()))
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|entry| dir_size(&entry.path()))
+        .sum()
+}
+
+fn is_spill_dir_name(name: &str) -> bool {
+    name.starts_with(".tmp") || name.starts_with("datafusion-")
+}
+
 /// Recursively sum the sizes of all files in a directory.
 /// Returns 0 if the directory does not exist or cannot be read.
 fn dir_size(path: &Path) -> u64 {
@@ -604,6 +636,27 @@ throttled_usec 0
         assert_eq!(dir_size(&tmp), 3072);
         // Non-existent directory returns 0
         assert_eq!(dir_size(Path::new("/nonexistent/path")), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_spill_size_counts_only_datafusion_dirs() {
+        let tmp = std::env::temp_dir().join("test_spill_size_monitor");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // DiskManager spill dirs: OsTmpDirectory mode and Directories mode.
+        std::fs::create_dir_all(tmp.join(".tmpAbC123")).unwrap();
+        std::fs::write(tmp.join(".tmpAbC123/.tmpXyZ789"), vec![0u8; 1000]).unwrap();
+        std::fs::create_dir_all(tmp.join("datafusion-QwE456")).unwrap();
+        std::fs::write(tmp.join("datafusion-QwE456/.tmpRtY000"), vec![0u8; 200]).unwrap();
+        // Compiler temp output that shares TMPDIR: not spill.
+        std::fs::create_dir_all(tmp.join("rustcKd93js")).unwrap();
+        std::fs::write(tmp.join("rustcKd93js/lib.rlib"), vec![0u8; 5000]).unwrap();
+        std::fs::write(tmp.join("ccA1b2C3.o"), vec![0u8; 7000]).unwrap();
+        // A loose top-level `.tmp*` file is not a DiskManager directory.
+        std::fs::write(tmp.join(".tmpLoose"), vec![0u8; 300]).unwrap();
+
+        assert_eq!(spill_size(&tmp), 1200);
+        assert_eq!(spill_size(Path::new("/nonexistent/path")), 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -34,8 +34,20 @@ impl ControllerClient {
     /// controller resolves both from the job's DB row.
     #[tracing::instrument(skip(self, body), fields(job_id = %self.job_id))]
     pub async fn post_comment(&self, _repo: &str, _pr_number: i64, body: &str) -> Result<()> {
-        let url = format!("{}/jobs/{}/comment", self.base_url, self.job_id);
-        let payload = json!({ "body": body });
+        self.submit("comment", json!({ "body": body })).await
+    }
+
+    /// Submit Criterion exports durably; the controller owns GitHub reporting.
+    pub async fn post_result(&self, result: &crate::shard_reporting::ShardResult) -> Result<()> {
+        self.submit("result", serde_json::to_value(result)?).await
+    }
+
+    pub async fn post_runner_info(&self, info: &crate::criterion_report::RunnerInfo) -> Result<()> {
+        self.submit("info", serde_json::to_value(info)?).await
+    }
+
+    async fn submit(&self, endpoint: &str, payload: serde_json::Value) -> Result<()> {
+        let url = format!("{}/jobs/{}/{endpoint}", self.base_url, self.job_id);
 
         // Retry everything: the controller is an internal service and a brief
         // outage (e.g. during a redeploy or Autopilot preemption) shouldn't
@@ -57,7 +69,7 @@ impl ControllerClient {
                     return Ok(());
                 }
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("controller comment endpoint returned {status}: {body}");
+                anyhow::bail!("controller {endpoint} endpoint returned {status}: {body}");
             }
         })
         .retry(

@@ -66,6 +66,31 @@ env:
   BENCH_FILTER: float
 ```
 
+### Benchmark sharding
+
+```yaml
+run benchmark arrow_writer
+shards: 4
+```
+
+`shards` accepts a value from **1–8**, defaulting to **1**. When set above 1,
+multiple benchmark workers execute in parallel, with each worker responsible for
+a subset of the benchmark cases. Distributed workers share the same frozen
+commit SHAs, and independently clone, build, discover, and measure their
+assigned cases.
+
+Omitting `shards` is equivalent to setting it to `1`, resulting in a single
+benchmark worker that executes all matching cases.
+
+Existing filters, ref/resource overrides, native execution order, and sequential
+baseline/changed measurement continue to apply.
+
+**DataFusion benchmarks are not currently eligible for sharding** because their
+mixed harnesses do not provide a uniform way to enumerate individual cases and
+execute arbitrary subsets without starting a separate process for each case.
+DataFusion requests specifying a shard count greater than 1 therefore fail with
+an error.
+
 ### Comparing specific branches or commits
 
 By default, benchmarks compare the PR's merge base (baseline) against the PR head (changed). You can override either side with any git ref (branch, tag, or commit SHA) using YAML:
@@ -129,6 +154,53 @@ changed:
 
 Per-side env vars override shared env vars when both set the same key.
 
+### Pod size and CPU architecture
+
+A run gets the controller's default pod: 12 vCPU, 65Gi of memory, on an ARM `c4a` node. A `resources:` block asks for something else:
+
+```yaml
+run benchmark tpch
+resources:
+  cpu: "16"
+  memory: "128Gi"
+  arch: arm64
+```
+
+Every key is optional, and a key you leave out keeps its default. `arch` is `arm64` or `amd64`, and selects the node's machine family (`c4a` or `c4`).
+
+`cpu` and `memory` are Kubernetes quantities. Requests and limits are set to the same value, which gives the pod Guaranteed QoS, so `cpu` is the number of cores the benchmark gets and `memory` is the point at which it is OOM-killed. Ephemeral storage stays at its own default and cannot be set from a trigger.
+
+Values are checked before the job is queued, and a bad one gets a reply on the PR instead of a pod that never starts:
+
+| Rule | Rejected example |
+|---|---|
+| `cpu` must be a Kubernetes CPU quantity above zero | `cpu: sixteen`, `cpu: 0` |
+| `memory` must be a Kubernetes memory quantity above zero | `memory: 128gi`, `memory: "1 Gi"` |
+| `memory` must not use the `m` suffix, which means milli-bytes | `memory: 128m` |
+| `arch` must be `arm64` or `amd64` | `arch: x86_64` |
+| `cpu` must not be above `MAX_CPU` (default `72`) | `cpu: 720` |
+| `memory` must not be above `MAX_MEMORY` (default `576Gi`) | `memory: 5760Gi` |
+
+The two caps are the largest `c4a` shape the Performance compute class offers. Raise them on the controller if the cluster can schedule more.
+
+The pod that ran is reported in each result comment: the **Instance:** line shows the node type and the pod's actual CPU and memory limits, and the **Run configuration** block repeats the `resources:` keys the trigger asked for.
+
+### Forced build settings
+
+DataFusion's release profile sets `lto = true` and `codegen-units = 1`, and the bench profile inherits it. A fat-LTO link peaks at 13-15 GB. `cargo bench --bench sql`, which runs the bench.sh SQL suites, links 7 binaries, so parallel links exceeded the 65 GiB pod limit and the pod was OOM-killed before any query ran. The two `dfbench` builds, which run for both sides at once, link one binary each at the same cost.
+
+The runner therefore forces these settings on every cargo build it starts, on both sides:
+
+| Variable | Value | Why |
+|---|---|---|
+| `CARGO_PROFILE_RELEASE_LTO` | `thin` | About 5 GB per link. Measured within ±1-2% of fat LTO at run time. `off` is about 5% slower. |
+| `CARGO_PROFILE_BENCH_LTO` | `thin` | Same, for `cargo bench` builds. |
+| `CARGO_BUILD_JOBS` | `5` | Limits parallel compiles and links. Measured on a 12-core host, a build from scratch took 14.0 min at 5 jobs against 11.9 min uncapped. At 3 jobs it took 17.6 min. |
+
+Both sides of a comparison build the same way, so comparisons are unaffected. Absolute timings move by about 1-2% against runs made before this change.
+
+A trigger's `env:` blocks cannot override these three variables. A build that is OOM-killed or times out gives no result at all. The values suit the default build: a run that also asks for debuginfo with `CARGO_PROFILE_RELEASE_DEBUG` makes each rustc much larger and may need the cap lowered in [controller/src/runner/build_env.rs](controller/src/runner/build_env.rs).
+
 ### What ran: the Run configuration block
 
 Every comment the runner posts — running, completed, and failed — states what it
@@ -151,6 +223,8 @@ baseline:
 changed:
   env:
     DATAFUSION_RUNTIME_MEMORY_LIMIT: "2G"
+resources:
+  memory: "128Gi"
 ```
 
 Sections with nothing to report are omitted, so an unconfigured run renders as
@@ -179,13 +253,17 @@ Without a limit nothing is recorded, and the section is omitted rather than
 reported as zero. The same applies per side — comparing against a baseline that
 predates #23985 renders that column as `n/a` with a note saying why.
 
+Only benchmarks that write a results JSON have pool peaks. The `dfbench` suites always do. The suites that `bench.sh` runs through the Criterion SQL harness (`cargo bench --bench sql`, e.g. `spill_views`, `wide_schema`, `predicate_eval`) do since [apache/datafusion#25644](https://github.com/apache/datafusion/pull/25644): the harness writes the same JSON, without timings, to `results/<side>/criterion/`, where `bench.sh compare` does not read it, so the Criterion timings still come only from `critcmp`. A suite that sets its own limit in SQL (`spill_views` does) records under that limit even without `DATAFUSION_RUNTIME_MEMORY_LIMIT`.
+
+The runner takes `bench.sh` from `main` but runs each side's own harness, so a side that predates that change writes no file for these suites. Criterion bench targets never write one. When you set a memory limit and neither side wrote a file for a benchmark, the section names it in a note, so you can tell "not available for this benchmark" from "nothing recorded". When only one side wrote a file, that side's column is `n/a` with a note that says why. The runner identifies these cases by the missing results JSON, not by a list of names.
+
 This is measurement only. Nothing asserts a relationship between what the pool
 accounts for and what the process actually allocates; operators deliberately
 leave in-flight batches untracked, so the gap between the two is expected and is
 not gated on.
 
-Only benchmarks that go through `bench.sh`/`dfbench` produce a results JSON;
-Criterion targets have no equivalent and are absent from the section.
+Criterion `[[bench]]` targets that the runner starts directly have no results
+JSON and are absent from the section.
 
 ### View the queue
 
@@ -252,12 +330,14 @@ controller/                Rust controller crate
     github.rs              GitHub REST API client
     github_poller.rs       Comment polling loop
     job_manager.rs         K8s Job lifecycle reconciler
+    shard_reporting.rs     Durable Criterion export collection and per-target notifications
+    criterion_report.rs    Shared native comparison and per-runner report formatting
     db.rs                  SQLite queries (jobs, seen comments, scan state)
     benchmarks.rs          Trigger parsing (no allowlist — any name is accepted)
   migrations/              SQLite schema
     runner/
       monitor.rs           Peak/avg RSS, CPU and spill sampling per benchmark invocation
-      pool_peak.rs         Per-query `pool_peak_bytes` from the results JSON
+      pool_peak.rs         Per-query `pool_peak_bytes` from the results JSON (dfbench and SQL-harness suites)
 runner/                    Benchmark runner container (builds project, runs benchmarks, posts results)
 queries/                   SQL query files for ClickBench
 scripts/                   Legacy benchmark scripts (reference)
@@ -277,9 +357,23 @@ cargo clippy --manifest-path controller/Cargo.toml -- -D warnings
 cargo test --manifest-path controller/Cargo.toml
 ```
 
+The shard-report integration tests exercise the real `critcmp` binary:
+
+```bash
+cargo install critcmp --version 0.1.8 --locked
+cargo test --workspace -- --include-ignored
+```
+
 ## Running Locally
 
 The controller needs a GitHub token and a runner image. SQLite is used for state (auto-created).
+
+The token must be a user token, not a GitHub App token, because the controller writes Gists. It needs these permissions:
+
+- For a classic PAT, use the `public_repo` and `gist` scopes. `public_repo` lets the controller post PR comments on the public watched repositories. `gist` lets it create Gists.
+- For a fine-grained PAT, give write access to issues and pull requests on the watched repositories, and set **Account permissions → Gists** to **Read and write**.
+
+When a benchmark report is too long for a PR comment, the controller uploads the full comparison to an unlisted Gist owned by the token's account and links it from the comment. Unlisted Gists are not private: anyone with the URL can read them. Without Gist write access, oversized reports show a reporting error instead of the full comparison.
 
 ```bash
 export GITHUB_TOKEN="ghp_..."
@@ -291,8 +385,10 @@ export WATCHED_REPOS="apache/datafusion:apache/arrow-rs"
 export POLL_INTERVAL_SECS=2
 export RECONCILE_INTERVAL_SECS=3
 export K8S_NAMESPACE="benchmarking"
-export DEFAULT_CPU=30
-export DEFAULT_MEMORY="60Gi"
+export DEFAULT_CPU=12
+export DEFAULT_MEMORY="65Gi"
+export MAX_CPU=72
+export MAX_MEMORY="576Gi"
 
 cargo run --manifest-path controller/Cargo.toml
 ```

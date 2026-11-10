@@ -3,12 +3,14 @@
 //! Result comments link back to the triggering comment, but the link alone
 //! doesn't say what the run actually did: one trigger comment fans out into one
 //! job (and one pod) per benchmark name, and a bare `run benchmarks` expands to
-//! the repo's default suite. So instead of quoting the trigger comment
-//! verbatim, these helpers re-render *this* run's configuration using the same
-//! YAML syntax the trigger accepts — a copy-pasteable reproduction of the run.
+//! the repo's default suite. So these helpers re-render *this* run's
+//! configuration using the same YAML syntax the trigger accepts. That block is
+//! a copy-pasteable reproduction of the run. A second block quotes the raw
+//! trigger comment, so readers also see exactly what was asked for.
 
 use std::collections::HashMap;
 
+use crate::resources::PodResources;
 use crate::runner::config::RunnerConfig;
 
 /// The resolved two-sided comparison for a run.
@@ -44,12 +46,46 @@ impl Comparison<'_> {
 /// which is how the default suite is requested.
 pub fn config_block(config: &RunnerConfig, bench_names: &str) -> String {
     format!(
-        "<details><summary>Run configuration</summary>\n\n\
+        "{}<details><summary>Run configuration</summary>\n\n\
          ```yaml\n\
          {}\n\
          ```\n\n\
-         </details>\n\n",
-        config_yaml(config, bench_names)
+         </details>\n\n{}",
+        if config.shard.count() > 1 {
+            format!(
+                "**Shard {}/{}** · assignment `{}`\n\n",
+                config.shard.index + 1,
+                config.shard.count(),
+                crate::sharding::ASSIGNMENT_VERSION
+            )
+        } else {
+            String::new()
+        },
+        config_yaml(config, bench_names),
+        trigger_comment_block(config.trigger_comment.as_deref()),
+    )
+}
+
+/// Longest trigger comment quoted in full. Longer comments are cut so the
+/// quote cannot push a result comment past GitHub's size limit.
+const MAX_TRIGGER_QUOTE_CHARS: usize = 4000;
+
+/// A collapsed `<details>` block quoting the raw trigger comment, or an empty
+/// string when the body is unknown.
+///
+/// The body goes in a code fence, not a `>` quote. In a fence GitHub renders
+/// no markdown and sends no `@mention` notifications.
+pub fn trigger_comment_block(body: Option<&str>) -> String {
+    let Some(body) = body.map(str::trim).filter(|b| !b.is_empty()) else {
+        return String::new();
+    };
+    let mut text: String = body.chars().take(MAX_TRIGGER_QUOTE_CHARS).collect();
+    if body.chars().count() > MAX_TRIGGER_QUOTE_CHARS {
+        text.push_str("\n… (truncated)");
+    }
+    format!(
+        "<details><summary>Trigger comment</summary>\n\n{}\n\n</details>\n\n",
+        crate::criterion_report::fenced(&text, "text")
     )
 }
 
@@ -62,6 +98,10 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         lines.push("run benchmarks".to_string());
     } else {
         lines.push(format!("run benchmark {names}"));
+    }
+
+    if config.shard.count() > 1 {
+        lines.push(format!("shards: {}", config.shard.count()));
     }
 
     if !config.shared_env_vars.is_empty() {
@@ -82,6 +122,8 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         &config.changed_env_vars,
     );
 
+    push_resources(&mut lines, &config.resources);
+
     // A trigger comment sets the filter through the shared `env:` block, which
     // is already rendered above. Only the scheduled main-tracking workflow sets
     // BENCH_FILTER outside that block — note it there so it isn't lost.
@@ -90,6 +132,25 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Append the `resources:` section, omitting it when the pod was built from
+/// the controller defaults. Only the fields the trigger named are rendered,
+/// so the block keeps asking for the same pod when it is pasted back.
+fn push_resources(lines: &mut Vec<String>, resources: &PodResources) {
+    if resources.is_empty() {
+        return;
+    }
+    lines.push("resources:".to_string());
+    for (key, value) in [
+        ("cpu", &resources.cpu),
+        ("memory", &resources.memory),
+        ("arch", &resources.arch),
+    ] {
+        if let Some(value) = value {
+            lines.push(format!("  {key}: {}", quote(value)));
+        }
+    }
 }
 
 /// Append a `baseline:`/`changed:` section, omitting it when the side has
@@ -136,6 +197,7 @@ mod tests {
 
     fn config() -> RunnerConfig {
         RunnerConfig {
+            trigger_comment: None,
             pr_url: "https://github.com/apache/datafusion/pull/42".into(),
             comment_id: "100".into(),
             comment_url: "https://github.com/apache/datafusion/pull/42#issuecomment-100".into(),
@@ -155,7 +217,39 @@ mod tests {
             baseline_ref: None,
             changed_ref: None,
             runner_repo_url: None,
+            resources: PodResources::default(),
+            shard: crate::sharding::Shard::default(),
+            frozen_sources: None,
         }
+    }
+
+    #[test]
+    fn shard_override_round_trips_and_header_is_separate() {
+        for count in [1, 4] {
+            let mut cfg = config();
+            cfg.shard = crate::sharding::Shard {
+                count,
+                index: count - 1,
+            };
+            let yaml = config_yaml(&cfg, "arrow_writer");
+            assert_eq!(yaml.contains(&format!("shards: {count}")), count > 1);
+            let req = crate::benchmarks::detect_benchmark(
+                &yaml,
+                &crate::resources::ResourceLimits::default(),
+            );
+            let crate::benchmarks::DetectResult::Parsed(req) = req else {
+                panic!("invalid reproduction YAML")
+            };
+            assert_eq!(req.shards, (count > 1).then_some(count));
+            let block = config_block(&cfg, "arrow_writer");
+            assert_eq!(block.contains("**Shard"), count > 1);
+        }
+        let mut one = config();
+        one.shard.count = 1;
+        assert_eq!(
+            config_block(&one, "arrow_writer"),
+            config_block(&config(), "arrow_writer")
+        );
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -208,9 +302,15 @@ mod tests {
         cfg.shared_env_vars = map(&[("CARGO_BUILD_JOBS", "1")]);
         cfg.baseline_ref = Some("v45.0.0".into());
         cfg.changed_env_vars = map(&[("DATAFUSION_RUNTIME_MEMORY_LIMIT", "2G")]);
+        cfg.resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
 
         let yaml = config_yaml(&cfg, "tpch clickbench_1");
-        let req = match crate::benchmarks::detect_benchmark(&yaml) {
+        let limits = crate::resources::ResourceLimits::default();
+        let req = match crate::benchmarks::detect_benchmark(&yaml, &limits) {
             crate::benchmarks::DetectResult::Parsed(req) => req,
             _ => panic!("re-rendered config did not parse: {yaml}"),
         };
@@ -222,6 +322,41 @@ mod tests {
                 .get("DATAFUSION_RUNTIME_MEMORY_LIMIT")
                 .unwrap(),
             "2G"
+        );
+        assert_eq!(req.resources, cfg.resources);
+    }
+
+    #[test]
+    fn yaml_omits_resources_for_a_default_sized_pod() {
+        assert_eq!(config_yaml(&config(), "tpch"), "run benchmark tpch");
+    }
+
+    #[test]
+    fn yaml_renders_the_requested_resources() {
+        let mut cfg = config();
+        cfg.resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
+        assert_eq!(
+            config_yaml(&cfg, "tpch"),
+            "run benchmark tpch\nresources:\n  cpu: \"16\"\n  memory: \"128Gi\"\n  arch: \"amd64\""
+        );
+    }
+
+    /// Only the fields the trigger named, so pasting the block back keeps the
+    /// rest on the controller defaults rather than pinning today's values.
+    #[test]
+    fn yaml_renders_only_the_requested_resource_fields() {
+        let mut cfg = config();
+        cfg.resources = PodResources {
+            memory: Some("128Gi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_yaml(&cfg, "tpch"),
+            "run benchmark tpch\nresources:\n  memory: \"128Gi\""
         );
     }
 
@@ -244,6 +379,39 @@ mod tests {
         let m = yaml.find("MMM").unwrap();
         let z = yaml.find("ZZZ").unwrap();
         assert!(a < m && m < z);
+    }
+
+    #[test]
+    fn trigger_comment_is_fenced_in_its_own_block() {
+        let mut cfg = config();
+        cfg.trigger_comment = Some("run benchmark tpch\nenv:\n  BENCH_FILTER: q1 @someone".into());
+        let block = config_block(&cfg, "tpch");
+        assert!(block.ends_with(
+            "<details><summary>Trigger comment</summary>\n\n\
+             ```text\nrun benchmark tpch\nenv:\n  BENCH_FILTER: q1 @someone\n```\n\n\
+             </details>\n\n"
+        ));
+    }
+
+    #[test]
+    fn missing_or_blank_trigger_comment_renders_nothing() {
+        assert_eq!(trigger_comment_block(None), "");
+        assert_eq!(trigger_comment_block(Some("  \n ")), "");
+    }
+
+    #[test]
+    fn trigger_comment_with_backticks_gets_a_longer_fence() {
+        let block = trigger_comment_block(Some("```\nrun benchmarks\n```"));
+        assert!(block.contains("````text\n```\nrun benchmarks\n```\n````"));
+    }
+
+    #[test]
+    fn long_trigger_comment_is_truncated() {
+        let body = "x".repeat(MAX_TRIGGER_QUOTE_CHARS + 10);
+        let block = trigger_comment_block(Some(&body));
+        let expected = format!("{}\n… (truncated)", "x".repeat(MAX_TRIGGER_QUOTE_CHARS));
+        assert!(block.contains(&expected));
+        assert!(!block.contains(&"x".repeat(MAX_TRIGGER_QUOTE_CHARS + 1)));
     }
 
     #[test]

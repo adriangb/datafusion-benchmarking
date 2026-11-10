@@ -7,6 +7,9 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use crate::resources::PodResources;
+use crate::sharding::{Shard, ASSIGNMENT_VERSION};
+
 /// Fields for inserting a new benchmark job into SQLite.
 pub struct JobInsert<'a> {
     pub comment_id: i64,
@@ -21,6 +24,13 @@ pub struct JobInsert<'a> {
     pub baseline_ref: Option<&'a str>,
     pub changed_ref: Option<&'a str>,
     pub job_type: &'a str,
+    /// Pod sizing asked for by the trigger comment. Each `None` field falls
+    /// back to the controller default when the pod is built.
+    pub resources: &'a PodResources,
+    pub shard: Shard,
+    pub resolved_source_json: Option<&'a str>,
+    /// Raw body of the trigger comment.
+    pub trigger_comment: Option<&'a str>,
 }
 
 /// SQLite row for a benchmark job. Status follows this state machine:
@@ -58,11 +68,50 @@ pub struct BenchmarkJob {
     /// `POST /jobs/{id}/comment` calls against the controller. `None` for
     /// legacy rows created before migration 003.
     pub runner_token: Option<String>,
+    /// Immutable resolved count, even when setup capabilities change later.
+    pub effective_shards: u32,
+    pub shard_index: u32,
+    pub assignment_version: Option<String>,
+    pub resolved_source_json: Option<String>,
+    /// Raw body of the trigger comment. `None` for rows queued before
+    /// migration 007. The default lets migration tests decode rows from older
+    /// schemas.
+    #[sqlx(default)]
+    pub trigger_comment: Option<String>,
+}
+
+impl BenchmarkJob {
+    pub fn uses_collected_results(&self) -> bool {
+        self.job_type == JobType::ArrowCriterion.as_str()
+    }
+
+    pub fn shard(&self) -> anyhow::Result<Shard> {
+        let shard = Shard {
+            count: self.effective_shards,
+            index: self.shard_index,
+        }
+        .validate()?;
+        if shard.count() > 1 {
+            anyhow::ensure!(
+                self.assignment_version.as_deref() == Some(ASSIGNMENT_VERSION),
+                "unsupported shard assignment version"
+            );
+        }
+        Ok(shard)
+    }
+
+    pub fn shard_label(&self) -> String {
+        Shard {
+            count: self.effective_shards,
+            index: self.shard_index,
+        }
+        .label()
+    }
 }
 
 /// Parsed user intent from a PR comment (e.g. `run benchmark tpch_mem`).
 /// Empty `benchmarks` means "run the default suite".
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BenchmarkRequest {
     pub benchmarks: Vec<String>,
     pub env_vars: HashMap<String, String>,
@@ -70,6 +119,8 @@ pub struct BenchmarkRequest {
     pub changed_env_vars: HashMap<String, String>,
     pub baseline_ref: Option<String>,
     pub changed_ref: Option<String>,
+    pub resources: PodResources,
+    pub shards: Option<u32>,
 }
 
 /// Benchmark runner variant.
@@ -85,6 +136,13 @@ pub enum JobType {
 }
 
 impl JobType {
+    pub fn shard_support(self) -> crate::sharding::ShardSupport {
+        match self {
+            Self::Datafusion => crate::runner::bench_datafusion::SHARD_SUPPORT,
+            Self::ArrowCriterion => crate::runner::bench_arrow::SHARD_SUPPORT,
+        }
+    }
+
     /// Returns the string stored in the `job_type` SQLite column.
     pub fn as_str(&self) -> &'static str {
         match self {
