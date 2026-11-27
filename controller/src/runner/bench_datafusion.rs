@@ -24,6 +24,12 @@
 //! `compare_detail` does not read, so its suites get pool peaks without a
 //! second timing table. Criterion `[[bench]]` targets write no such JSON, so
 //! they have no pool peaks.
+//!
+//! With `rounds: N` (from `BENCH_ROUNDS`), each `bench.sh` suite runs in
+//! [`abba_order`]. Each pass writes to `results/<side>.pass<k>/`, and
+//! [`merge_pass_dirs`] combines the passes into `results/<side>/` before the
+//! comparison. Resource stats and pool peaks come from each side's first pass.
+//! Criterion `[[bench]]` targets still run once per side.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -277,49 +283,77 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
         info!("** Creating data if needed for {bench} **");
         cache_data(bench, &bench_dir_str).await;
 
-        info!("** Running {bench} baseline **");
-        let base_spill_dir = PathBuf::from(format!("/workspace/spill-base-{bench}"));
-        let _ = tokio::fs::create_dir_all(&base_spill_dir).await;
-        // The results file name doesn't follow the benchmark name, so bracket
-        // the run and attribute whatever JSON appears to this invocation.
-        let base_before = pool_peak::snapshot_json_files(&base_results_dir).await;
-        let base_stats = run_shell_side(
-            bench,
-            &base_dir,
-            &bench_benchmarks,
-            &base_results_name,
-            &base_spill_dir,
-            &baseline_extra_env,
-            config.shard,
-        )
-        .await
-        .with_context(|| format!("run {bench} (base)"))?;
-        let _ = tokio::fs::remove_dir_all(&base_spill_dir).await;
-        base_peaks.extend(pool_peak::collect_new(&base_results_dir, &base_before, bench).await);
-        if let Some(stats) = base_stats {
-            base_stats_list.push((bench.clone(), stats));
-        }
+        let mut base_pass_dirs: Vec<PathBuf> = Vec::new();
+        let mut branch_pass_dirs: Vec<PathBuf> = Vec::new();
+        for (pass, side) in abba_order(config.rounds).into_iter().enumerate() {
+            let (label, side_dir, side_name, side_results_dir, extra_env) = match side {
+                Side::Baseline => (
+                    "base",
+                    &base_dir,
+                    &base_results_name,
+                    &base_results_dir,
+                    &baseline_extra_env,
+                ),
+                Side::Branch => (
+                    "branch",
+                    &branch_dir,
+                    &bench_branch_name,
+                    &branch_results_dir,
+                    &changed_extra_env,
+                ),
+            };
+            let (results_name, results_dir) = if config.rounds == 1 {
+                (side_name.clone(), side_results_dir.clone())
+            } else {
+                let name = format!("{side_name}.pass{pass}");
+                let dir = bench_benchmarks.join("results").join(&name);
+                (name, dir)
+            };
+            let extra_env = with_split_max_time(extra_env, config, side, config.rounds);
 
-        info!("** Running {bench} branch **");
-        let branch_spill_dir = PathBuf::from(format!("/workspace/spill-branch-{bench}"));
-        let _ = tokio::fs::create_dir_all(&branch_spill_dir).await;
-        let branch_before = pool_peak::snapshot_json_files(&branch_results_dir).await;
-        let branch_stats = run_shell_side(
-            bench,
-            &branch_dir,
-            &bench_benchmarks,
-            &bench_branch_name,
-            &branch_spill_dir,
-            &changed_extra_env,
-            config.shard,
-        )
-        .await
-        .with_context(|| format!("run {bench} (branch)"))?;
-        let _ = tokio::fs::remove_dir_all(&branch_spill_dir).await;
-        branch_peaks
-            .extend(pool_peak::collect_new(&branch_results_dir, &branch_before, bench).await);
-        if let Some(stats) = branch_stats {
-            branch_stats_list.push((bench.clone(), stats));
+            info!("** Running {bench} {label} (pass {pass}) **");
+            let spill_dir = PathBuf::from(format!("/workspace/spill-{label}-{bench}"));
+            let _ = tokio::fs::create_dir_all(&spill_dir).await;
+            // The results file name doesn't follow the benchmark name, so bracket
+            // the run and attribute whatever JSON appears to this invocation.
+            let before = pool_peak::snapshot_json_files(&results_dir).await;
+            let stats = run_shell_side(
+                bench,
+                side_dir,
+                &bench_benchmarks,
+                &results_name,
+                side_name,
+                &spill_dir,
+                &extra_env,
+                config.shard,
+            )
+            .await
+            .with_context(|| format!("run {bench} ({label}, pass {pass})"))?;
+            let _ = tokio::fs::remove_dir_all(&spill_dir).await;
+            let peaks = pool_peak::collect_new(&results_dir, &before, bench).await;
+
+            let (pass_dirs, peaks_list, stats_list) = match side {
+                Side::Baseline => (&mut base_pass_dirs, &mut base_peaks, &mut base_stats_list),
+                Side::Branch => (
+                    &mut branch_pass_dirs,
+                    &mut branch_peaks,
+                    &mut branch_stats_list,
+                ),
+            };
+            // Pool peaks and resource stats come from each side's first pass
+            // only: they describe one run of the suite, and later passes
+            // repeat the same work.
+            if pass_dirs.is_empty() {
+                peaks_list.extend(peaks);
+                if let Some(stats) = stats {
+                    stats_list.push((bench.clone(), stats));
+                }
+            }
+            pass_dirs.push(results_dir);
+        }
+        if config.rounds > 1 {
+            merge_pass_dirs(&base_pass_dirs, &base_results_dir).await?;
+            merge_pass_dirs(&branch_pass_dirs, &branch_results_dir).await?;
         }
     }
 
@@ -558,11 +592,13 @@ async fn run_criterion_side(
 /// `bench_dir/benchmarks/results/`). The `dfbench tpch` subcommand still
 /// exists upstream, so we call it directly with the same args the old
 /// `run_tpch` used. Other benchmarks continue through `bench.sh`.
+#[allow(clippy::too_many_arguments)]
 async fn run_shell_side(
     bench: &str,
     side_dir: &Path,
     bench_benchmarks: &Path,
     results_name: &str,
+    criterion_baseline: &str,
     spill_dir: &Path,
     extra_env: &[String],
     shard: Shard,
@@ -579,7 +615,13 @@ async fn run_shell_side(
         )
         .await?
     } else {
-        let mut args = shell_side_env_args(side_dir, results_name, spill_dir, extra_env);
+        let mut args = shell_side_env_args(
+            side_dir,
+            results_name,
+            criterion_baseline,
+            spill_dir,
+            extra_env,
+        );
         args.extend([
             "./bench.sh".to_string(),
             "run".to_string(),
@@ -602,6 +644,7 @@ async fn run_shell_side(
 fn shell_side_env_args(
     side_dir: &Path,
     results_name: &str,
+    criterion_baseline: &str,
     spill_dir: &Path,
     extra_env: &[String],
 ) -> Vec<String> {
@@ -612,7 +655,11 @@ fn shell_side_env_args(
         // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
         // dfbench-based suites (which never read it) and saves a named
         // baseline per side for the ones that do, so we can critcmp them.
-        format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
+        // The baseline is named after the side, not the pass, so `critcmp`
+        // finds it. With several rounds the last pass's baseline wins.
+        format!(
+            "SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {criterion_baseline}"
+        ),
     ];
     args.extend(extra_env.iter().cloned());
     // After `extra_env`, so a trigger cannot move the spill files away from
@@ -672,6 +719,145 @@ fn tpch_direct_args(bench: &str) -> Option<(Vec<String>, String)> {
         format!("tpch_sf{sf}.json")
     };
     Some((args, results_filename))
+}
+
+/// Which side of the comparison a pass runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Baseline,
+    Branch,
+}
+
+/// Pass order for `rounds` interleaved rounds: A B, B A, A B, ...
+///
+/// Each pair of rounds is a palindrome (A B B A), so a linear drift in node
+/// speed adds the same total delay to both sides.
+fn abba_order(rounds: u32) -> Vec<Side> {
+    (0..rounds)
+        .flat_map(|round| {
+            if round % 2 == 0 {
+                [Side::Baseline, Side::Branch]
+            } else {
+                [Side::Branch, Side::Baseline]
+            }
+        })
+        .collect()
+}
+
+/// `extra_env` plus a `MAX_TIME` that gives each round an equal share of the
+/// requested time budget, so `rounds: N` does not multiply the run time.
+///
+/// The side's own env wins over the shared `env:` block, as it does for the
+/// run itself. Appending works because `env` applies its args left to right,
+/// and the shared block reaches the process only through the pod env.
+fn with_split_max_time(
+    extra_env: &[String],
+    config: &RunnerConfig,
+    side: Side,
+    rounds: u32,
+) -> Vec<String> {
+    let mut env = extra_env.to_vec();
+    if rounds <= 1 {
+        return env;
+    }
+    let side_env = match side {
+        Side::Baseline => &config.baseline_env_vars,
+        Side::Branch => &config.changed_env_vars,
+    };
+    let requested = side_env
+        .get("MAX_TIME")
+        .or_else(|| config.shared_env_vars.get("MAX_TIME"));
+    if let Some(requested) = requested {
+        match requested.trim().parse::<f64>() {
+            Ok(total) if total > 0.0 => {
+                env.push(format!("MAX_TIME={}", total / f64::from(rounds)));
+            }
+            _ => warn!("MAX_TIME={requested} is not a positive number; not splitting it"),
+        }
+    }
+    env
+}
+
+/// Merge several dfbench results JSON documents for the same suite into one.
+///
+/// The first document supplies everything except iterations. Each later
+/// document's per-query `iterations` are appended to the query with the same
+/// `query` field. A query that only a later document has is appended whole.
+fn merge_results_json(docs: &[serde_json::Value]) -> Result<serde_json::Value> {
+    let (first, rest) = docs.split_first().context("no results to merge")?;
+    let mut merged = first.clone();
+    let queries = merged
+        .get_mut("queries")
+        .and_then(|q| q.as_array_mut())
+        .context("results JSON has no `queries` array")?;
+    for doc in rest {
+        let Some(more) = doc.get("queries").and_then(|q| q.as_array()) else {
+            continue;
+        };
+        for query in more {
+            let existing = queries
+                .iter_mut()
+                .find(|q| q.get("query").is_some() && q.get("query") == query.get("query"));
+            let Some(existing) = existing else {
+                queries.push(query.clone());
+                continue;
+            };
+            let extra = query
+                .get("iterations")
+                .and_then(|i| i.as_array())
+                .cloned()
+                .unwrap_or_default();
+            match existing
+                .get_mut("iterations")
+                .and_then(|i| i.as_array_mut())
+            {
+                Some(iterations) => iterations.extend(extra),
+                None => existing["iterations"] = serde_json::Value::Array(extra),
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Merge each top-level `*.json` file that the first pass wrote into `dest`,
+/// combining the same file from every pass with [`merge_results_json`].
+///
+/// A pass that lacks the file is skipped: a failed pass already aborts the
+/// run, so this is a suite that writes its output conditionally.
+async fn merge_pass_dirs(pass_dirs: &[PathBuf], dest: &Path) -> Result<()> {
+    let Some(first) = pass_dirs.first() else {
+        return Ok(());
+    };
+    let mut entries = match tokio::fs::read_dir(first).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    tokio::fs::create_dir_all(dest)
+        .await
+        .with_context(|| format!("creating {}", dest.display()))?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        if Path::new(&name).extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let mut docs = Vec::new();
+        for dir in pass_dirs {
+            let path = dir.join(&name);
+            let Ok(text) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            docs.push(
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            );
+        }
+        let merged = merge_results_json(&docs)
+            .with_context(|| format!("merging {}", name.to_string_lossy()))?;
+        tokio::fs::write(dest.join(&name), serde_json::to_vec_pretty(&merged)?)
+            .await
+            .with_context(|| format!("writing merged {}", name.to_string_lossy()))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1100,9 +1286,147 @@ mod tests {
         shell_side_env_args(
             Path::new("/workspace/base"),
             "HEAD",
+            "HEAD",
             Path::new("/workspace/spill"),
             &extra_env,
         )
+    }
+
+    #[test]
+    fn abba_order_alternates_within_each_round() {
+        use Side::{Baseline as A, Branch as B};
+        assert_eq!(abba_order(1), vec![A, B]);
+        assert_eq!(abba_order(2), vec![A, B, B, A]);
+        assert_eq!(abba_order(3), vec![A, B, B, A, A, B]);
+        assert_eq!(abba_order(4), vec![A, B, B, A, A, B, B, A]);
+    }
+
+    #[test]
+    fn merge_results_appends_iterations_by_query() {
+        let pass0 = serde_json::json!({
+            "context": {"benchmark_version": "1"},
+            "queries": [
+                {"query": "Q1", "iterations": [{"elapsed": 1.0, "row_count": 4}],
+                 "start_time": 10, "success": true},
+                {"query": "Q2", "iterations": [{"elapsed": 2.0, "row_count": 1}],
+                 "start_time": 11, "success": true},
+            ],
+        });
+        let pass1 = serde_json::json!({
+            "context": {"benchmark_version": "other"},
+            "queries": [
+                {"query": "Q2", "iterations": [{"elapsed": 2.5, "row_count": 1}],
+                 "start_time": 21, "success": true},
+                {"query": "Q1", "iterations": [{"elapsed": 1.5, "row_count": 4},
+                                               {"elapsed": 1.6, "row_count": 4}],
+                 "start_time": 20, "success": true},
+                {"query": "Q3", "iterations": [{"elapsed": 3.0, "row_count": 0}],
+                 "start_time": 22, "success": true},
+            ],
+        });
+        let merged = merge_results_json(&[pass0, pass1]).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "context": {"benchmark_version": "1"},
+                "queries": [
+                    {"query": "Q1", "iterations": [{"elapsed": 1.0, "row_count": 4},
+                                                   {"elapsed": 1.5, "row_count": 4},
+                                                   {"elapsed": 1.6, "row_count": 4}],
+                     "start_time": 10, "success": true},
+                    {"query": "Q2", "iterations": [{"elapsed": 2.0, "row_count": 1},
+                                                   {"elapsed": 2.5, "row_count": 1}],
+                     "start_time": 11, "success": true},
+                    {"query": "Q3", "iterations": [{"elapsed": 3.0, "row_count": 0}],
+                     "start_time": 22, "success": true},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn merge_results_rejects_empty_and_malformed_input() {
+        assert!(merge_results_json(&[]).is_err());
+        assert!(merge_results_json(&[serde_json::json!({"context": {}})]).is_err());
+    }
+
+    #[tokio::test]
+    async fn merge_pass_dirs_writes_merged_files_to_dest() {
+        let root = std::env::temp_dir().join("bench_datafusion_merge_pass_dirs");
+        let _ = std::fs::remove_dir_all(&root);
+        let passes: Vec<PathBuf> = (0..2).map(|i| root.join(format!("HEAD.pass{i}"))).collect();
+        for (i, dir) in passes.iter().enumerate() {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("tpch_sf1.json"),
+                format!(
+                    r#"{{"queries": [{{"query": "Q1", "iterations": [{{"elapsed": {i}}}]}}]}}"#
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(passes[0].join("notes.txt"), "ignored").unwrap();
+        let dest = root.join("HEAD");
+        merge_pass_dirs(&passes, &dest).await.unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join("tpch_sf1.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            merged["queries"][0]["iterations"],
+            serde_json::json!([{"elapsed": 0}, {"elapsed": 1}])
+        );
+        assert!(!dest.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn max_time_config(shared: &[(&str, &str)], changed: &[(&str, &str)]) -> RunnerConfig {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        RunnerConfig {
+            pr_url: String::new(),
+            comment_id: String::new(),
+            comment_url: String::new(),
+            benchmarks: String::new(),
+            bench_type: crate::runner::config::BenchType::Datafusion,
+            bench_name: String::new(),
+            bench_filter: String::new(),
+            repo: String::new(),
+            poster_mode: crate::runner::config::PosterMode::Direct {
+                github_token: String::new(),
+            },
+            sccache_gcs_bucket: None,
+            data_cache_bucket: None,
+            shared_env_vars: map(shared),
+            baseline_env_vars: Default::default(),
+            changed_env_vars: map(changed),
+            baseline_ref: None,
+            changed_ref: None,
+            runner_repo_url: None,
+            resources: Default::default(),
+            shard: Shard::default(),
+            frozen_sources: None,
+            trigger_comment: None,
+            rounds: 4,
+        }
+    }
+
+    #[test]
+    fn max_time_is_split_across_rounds() {
+        let cfg = max_time_config(&[("MAX_TIME", "20")], &[("MAX_TIME", "10")]);
+        let base = with_split_max_time(&["A=1".into()], &cfg, Side::Baseline, 4);
+        assert_eq!(base, vec!["A=1".to_string(), "MAX_TIME=5".to_string()]);
+        let branch = with_split_max_time(&[], &cfg, Side::Branch, 4);
+        assert_eq!(branch, vec!["MAX_TIME=2.5".to_string()]);
+        assert!(with_split_max_time(&[], &cfg, Side::Baseline, 1).is_empty());
+        let unset = max_time_config(&[], &[]);
+        assert!(with_split_max_time(&[], &unset, Side::Baseline, 4).is_empty());
+        let bad = max_time_config(&[("MAX_TIME", "soon")], &[]);
+        assert!(with_split_max_time(&[], &bad, Side::Baseline, 4).is_empty());
     }
 
     #[test]
