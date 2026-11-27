@@ -58,10 +58,7 @@ pub(crate) fn is_retryable(err: &anyhow::Error) -> bool {
 
     // Check for our own "GitHub API … error …" messages (from check_response)
     let msg = err.to_string();
-    if msg.contains("error 5") || msg.contains("error 429") {
-        return true;
-    }
-    false
+    msg.contains("error 5") || msg.contains("error 429")
 }
 
 /// Parse the `Retry-After` header (seconds) from a 429 response.
