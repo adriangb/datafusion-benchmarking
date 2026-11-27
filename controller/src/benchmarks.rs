@@ -26,6 +26,28 @@ struct CommentConfig {
     resources: Option<ResourcesConfig>,
     #[serde(default, deserialize_with = "deserialize_shards")]
     shards: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_rounds")]
+    rounds: Option<u32>,
+}
+
+/// Upper bound on `rounds:`. Each round runs the suite once per side, so this
+/// caps the pod's wall time at that many full runs.
+pub const MAX_ROUNDS: u32 = 10;
+
+fn deserialize_rounds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    let count = value
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| (1..=MAX_ROUNDS).contains(v))
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "rounds must be an integer between 1 and {MAX_ROUNDS}"
+            ))
+        })?;
+    Ok(Some(count))
 }
 
 fn deserialize_shards<'de, D: serde::Deserializer<'de>>(
@@ -110,6 +132,7 @@ fn parse_sections(lines: &[&str], limits: &ResourceLimits) -> Result<BenchmarkRe
 
     Ok(BenchmarkRequest {
         shards: config.shards,
+        rounds: config.rounds,
         benchmarks: vec![],
         env_vars: shared_env,
         baseline_env_vars: baseline_env,
@@ -283,7 +306,16 @@ pub fn usage_message() -> String {
          Each shard builds both revisions, measures its assigned cases, and posts \
          its own report. Resources and the job deadline apply per shard. \
          DataFusion requests specifying a shard count greater than 1 fail with \
-         an error. Omit shards or use shards: 1 for DataFusion."
+         an error. Omit shards or use shards: 1 for DataFusion.\n\n\
+         Interleaved rounds for `bench.sh` suites (optional; 1–10, default 1):\n\
+         ```yaml\n\
+         run benchmark tpch\n\
+         rounds: 3\n\
+         ```\n\
+         The runner alternates baseline (A) and branch (B) passes in ABBA order \
+         (A B B A A B), so slow drift on the node hits both sides equally, then \
+         compares all iterations from every pass. A `MAX_TIME` env value is \
+         split evenly across the rounds. Criterion targets run once."
         .to_string()
 }
 
@@ -345,6 +377,24 @@ mod tests {
 
     fn is_parsed(result: &DetectResult) -> bool {
         matches!(result, DetectResult::Parsed(_))
+    }
+
+    #[test]
+    fn rounds_is_optional_and_bounded() {
+        assert_eq!(unwrap_parsed(detect("run benchmark tpch")).rounds, None);
+        assert_eq!(
+            unwrap_parsed(detect("run benchmark tpch\nrounds: 3")).rounds,
+            Some(3)
+        );
+        for value in ["0", "11", "-1", "2.5", "two", "null"] {
+            assert!(
+                matches!(
+                    detect(&format!("run benchmark tpch\nrounds: {value}")),
+                    DetectResult::ConfigError(_)
+                ),
+                "rounds: {value} should be rejected"
+            );
+        }
     }
 
     #[test]
