@@ -639,6 +639,9 @@ async fn create_k8s_job(
     if let Some(body) = &job.trigger_comment {
         env.push(env_var("TRIGGER_COMMENT", body.clone()));
     }
+    if let Some(rounds) = job.rounds {
+        env.push(env_var("BENCH_ROUNDS", rounds.to_string()));
+    }
 
     // Also pass the shared block as a JSON map. The pod already has these set
     // individually (above); the map lets the runner report them in PR comments
@@ -907,6 +910,7 @@ mod tests {
     fn test_job() -> BenchmarkJob {
         BenchmarkJob {
             trigger_comment: None,
+            rounds: None,
             id: 1,
             comment_id: 123,
             repo: "apache/datafusion".to_string(),

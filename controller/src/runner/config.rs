@@ -5,7 +5,7 @@
 //! `BENCH_NAME`, `BENCH_FILTER`, `REPO`, `JOB_ID`, `RUNNER_TOKEN`,
 //! `CONTROLLER_URL`, `RUNNER_REPO_URL`, `SHARED_ENV_VARS`,
 //! `BASELINE_ENV_VARS`, `CHANGED_ENV_VARS`, `REQUESTED_CPU`,
-//! `REQUESTED_MEMORY`, `REQUESTED_ARCH`. The scheduled main-tracking
+//! `REQUESTED_MEMORY`, `REQUESTED_ARCH`, `BENCH_ROUNDS`. The scheduled main-tracking
 //! workflow instead supplies `GITHUB_TOKEN` directly (no PR author to
 //! distrust).
 
@@ -98,6 +98,9 @@ pub struct RunnerConfig {
     pub frozen_sources: Option<FrozenSources>,
     /// Raw body of the trigger comment, quoted in result comments.
     pub trigger_comment: Option<String>,
+    /// Interleaved baseline/branch rounds for `bench.sh` suites, from
+    /// `BENCH_ROUNDS`. 1 runs each side once.
+    pub rounds: u32,
 }
 
 impl RunnerConfig {
@@ -152,6 +155,11 @@ impl RunnerConfig {
             changed_ref: std::env::var("CHANGED_REF").ok(),
             runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
             trigger_comment: std::env::var("TRIGGER_COMMENT").ok(),
+            rounds: std::env::var("BENCH_ROUNDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(1),
             resources: PodResources {
                 cpu: std::env::var("REQUESTED_CPU").ok(),
                 memory: std::env::var("REQUESTED_MEMORY").ok(),

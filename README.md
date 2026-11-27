@@ -91,6 +91,29 @@ execute arbitrary subsets without starting a separate process for each case.
 DataFusion requests specifying a shard count greater than 1 therefore fail with
 an error.
 
+### Interleaved rounds
+
+```yaml
+run benchmark tpch
+rounds: 3
+env:
+  MAX_TIME: "30"
+```
+
+`rounds` accepts a value from **1–10**, defaulting to **1**. With `rounds: N`
+the runner runs each `bench.sh` suite in ABBA order (baseline, branch, branch,
+baseline, ...), so slow drift on the node affects both sides equally. Each pass
+writes its own results JSON. The runner appends every pass's per-query
+iterations into one file per side and compares those.
+
+| Behavior | With `rounds: N` |
+| --- | --- |
+| `MAX_TIME` (side env, else shared env) | Each pass gets `MAX_TIME / N` |
+| Timing table | All iterations from all passes |
+| Resource stats and pool peaks | First pass of each side |
+| Criterion `[[bench]]` targets | Run once, not interleaved |
+| Criterion SQL harness baselines | Last pass of each side |
+
 ### Comparing specific branches or commits
 
 By default, benchmarks compare the PR's merge base (baseline) against the PR head (changed). You can override either side with any git ref (branch, tag, or commit SHA) using YAML:

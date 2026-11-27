@@ -33,6 +33,7 @@ pub(crate) async fn request(
         for index in 0..count {
             jobs.push(JobInsert {
                 trigger_comment: None,
+                rounds: None,
                 comment_id,
                 repo: "apache/arrow-rs",
                 pr_number: 42,
@@ -282,6 +283,7 @@ async fn direct_arrow_reports_use_the_shared_formatter_without_a_controller() {
     let poster = CommentPoster::Direct(gh);
     let mut config = RunnerConfig {
         trigger_comment: None,
+        rounds: 1,
         pr_url: "https://github.com/apache/arrow-rs/pull/42".into(),
         comment_id: "123".into(),
         comment_url: "https://github.com/apache/arrow-rs/pull/42#issuecomment-123".into(),
@@ -873,7 +875,7 @@ async fn migration_from_deployed_schema_preserves_jobs_and_reports_only_outstand
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let after: Vec<JobState> = sqlx::query_as(job_state).fetch_all(&pool).await.unwrap();
         assert_eq!(before, after);
         let jobs: Vec<BenchmarkJob> = sqlx::query_as("SELECT * FROM benchmark_jobs")

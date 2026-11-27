@@ -31,6 +31,8 @@ pub struct JobInsert<'a> {
     pub resolved_source_json: Option<&'a str>,
     /// Raw body of the trigger comment.
     pub trigger_comment: Option<&'a str>,
+    /// Interleaved baseline/branch rounds (`rounds: N`).
+    pub rounds: Option<u32>,
 }
 
 /// SQLite row for a benchmark job. Status follows this state machine:
@@ -78,6 +80,10 @@ pub struct BenchmarkJob {
     /// schemas.
     #[sqlx(default)]
     pub trigger_comment: Option<String>,
+    /// Interleaved baseline/branch rounds. `None` means one round, and is
+    /// what rows queued before migration 008 decode to.
+    #[sqlx(default)]
+    pub rounds: Option<u32>,
 }
 
 impl BenchmarkJob {
@@ -121,6 +127,7 @@ pub struct BenchmarkRequest {
     pub changed_ref: Option<String>,
     pub resources: PodResources,
     pub shards: Option<u32>,
+    pub rounds: Option<u32>,
 }
 
 /// Benchmark runner variant.

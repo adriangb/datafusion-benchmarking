@@ -104,6 +104,10 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         lines.push(format!("shards: {}", config.shard.count()));
     }
 
+    if config.rounds > 1 {
+        lines.push(format!("rounds: {}", config.rounds));
+    }
+
     if !config.shared_env_vars.is_empty() {
         lines.push("env:".to_string());
         lines.extend(env_lines(&config.shared_env_vars, "  "));
@@ -198,6 +202,7 @@ mod tests {
     fn config() -> RunnerConfig {
         RunnerConfig {
             trigger_comment: None,
+            rounds: 1,
             pr_url: "https://github.com/apache/datafusion/pull/42".into(),
             comment_id: "100".into(),
             comment_url: "https://github.com/apache/datafusion/pull/42#issuecomment-100".into(),
@@ -324,6 +329,21 @@ mod tests {
             "2G"
         );
         assert_eq!(req.resources, cfg.resources);
+    }
+
+    #[test]
+    fn yaml_round_trips_rounds() {
+        let mut cfg = config();
+        cfg.rounds = 3;
+        let yaml = config_yaml(&cfg, "tpch");
+        assert_eq!(yaml, "run benchmark tpch\nrounds: 3");
+        let limits = crate::resources::ResourceLimits::default();
+        let crate::benchmarks::DetectResult::Parsed(req) =
+            crate::benchmarks::detect_benchmark(&yaml, &limits)
+        else {
+            panic!("invalid reproduction YAML")
+        };
+        assert_eq!(req.rounds, Some(3));
     }
 
     #[test]
